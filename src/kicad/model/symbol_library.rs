@@ -1,4 +1,3 @@
-use serde::Serialize;
 use crate::kicad::model::common::{Id, Position, StrokeDefinition, TextEffect};
 use crate::kicad::syntax::{PositionPreference, SyntaxArgument, SyntaxItem, SyntaxItemSerializable, TopLevelSerializable};
 
