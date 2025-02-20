@@ -3,9 +3,9 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::easyeda::json_reader::JsonArrayReader;
-use crate::easyeda::model::{ParserError};
-use crate::kicad::model::common::{Font, FontSize, Position, TextEffect};
-use crate::kicad::model::footprint_library::{DrillDefinition, FootprintArc, FootprintAttributes, FootprintCircle, FootprintLibrary, FootprintLine, FootprintPad, FootprintPolygon, FootprintType, PadShape, PadType, PcbLayer, Scalar2D, Scalar3D};
+use crate::easyeda::{ParserError, ParserType};
+use crate::kicad::model::common::{Font, FontSize, Position, TextEffect, TextJustifyHorizontal, TextJustifyVertical};
+use crate::kicad::model::footprint_library::{DrillDefinition, FootprintArc, FootprintAttributes, FootprintCircle, FootprintLibrary, FootprintLine, FootprintPad, FootprintPolygon, FootprintText, FootprintTextType, FootprintType, PadShape, PadType, PcbLayer, Scalar2D, Scalar3D};
 
 #[derive(Debug)]
 pub struct EasyEDAFootprint {
@@ -24,6 +24,7 @@ pub struct EasyEDAFootprint {
     pub rule_template: Option<RuleTemplate>,
     pub rules: Vec<Rule>,
     pub primitives: Vec<Primitive>,
+    pub strings: HashMap<String, StringObject>,
 }
 
 impl EasyEDAFootprint {
@@ -45,6 +46,7 @@ impl EasyEDAFootprint {
         let mut attributes = Vec::new();
         let mut nets = Vec::new();
         let mut primitives = Vec::new();
+        let mut strings = HashMap::new();
 
         let mut active_layer = 0;
 
@@ -95,6 +97,9 @@ impl EasyEDAFootprint {
                 FootprintProperty::RULE(rule) => {
                     rules.push(rule);
                 }
+                FootprintProperty::STRING(string) => {
+                    strings.insert(string.id.clone(), string);
+                }
                 FootprintProperty::ATTR(attribute) => {
                     if attribute.parent_id.is_none() {
                         attributes.push(attribute);
@@ -129,6 +134,7 @@ impl EasyEDAFootprint {
             nets,
             rule_template,
             rules,
+            strings,
             attributes,
             primitives,
         })
@@ -468,7 +474,7 @@ impl Into<FootprintLibrary> for EasyEDAFootprint {
                         locked: false,
                     })
                 } else {
-                    //panic!("This type of fill element is not currently implemented: {:?}", fill);
+                    panic!("This type of fill element is not currently implemented: {:?}", fill);
 
                     // todo handle [0, 55, "ARC", -90,-20, 75, "L", -20, 125, 20, 125, 20, 75, "ARC", -90, 0, 55]
                 }
@@ -626,6 +632,42 @@ impl Into<FootprintLibrary> for EasyEDAFootprint {
             footprint.pads.push(ki_pad);
         }
 
+        // Strings
+        for (_id, string) in &self.strings {
+            let layer = self.layers.get(&string.layer_id).unwrap();
+            let kicad_layer = get_kicad_layer(layer);
+            if kicad_layer.is_none() {
+                continue;
+            }
+            let kicad_layer = kicad_layer.unwrap();
+
+            let mut text_style = default_text_effect.clone();
+            text_style.font.bold = string.is_bold;
+            text_style.font.italic = string.is_italic;
+            text_style.font.size.width = string.font_size * scale_factor;
+            text_style.font.size.height = string.font_size * scale_factor;
+            (text_style.justify.justify_horizontal, text_style.justify.justify_vertical) = match string.origin as u32 {
+                1 => (Some(TextJustifyHorizontal::Left), Some(TextJustifyVertical::Bottom)),
+                2 | 3 => (Some(TextJustifyHorizontal::Left), Some(TextJustifyVertical::Top)),
+                4 => (Some(TextJustifyHorizontal::Right), Some(TextJustifyVertical::Bottom)),
+                5 | 6 => (Some(TextJustifyHorizontal::Right), Some(TextJustifyVertical::Top)),
+                7 => (Some(TextJustifyHorizontal::Right), Some(TextJustifyVertical::Bottom)),
+                8 | 9 | _ => (Some(TextJustifyHorizontal::Right), Some(TextJustifyVertical::Top)),
+            };
+            println!("{}", string.origin);
+
+            footprint.texts.push(FootprintText {
+                text_type: FootprintTextType::User,
+                text: string.text.clone(),
+                position: Position { x: string.pos_x * scale_factor, y: string.pos_y * scale_factor, angle: Some(string.angle) },
+                unlocked: Some(true),
+                layer: kicad_layer,
+                hide: false,
+                effects: text_style,
+                uuid: None,
+            });
+        }
+
         max_y += default_text_effect.font.size.height;
         min_y -= default_text_effect.font.size.height;
 
@@ -753,6 +795,27 @@ pub struct Primitive {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct StringObject {
+    pub id: String,
+    pub group_id: u32,
+    pub layer_id: u8,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub text: String,
+    pub font_family: String,
+    pub font_size: f32,
+    pub stroke_width: f32,
+    pub is_bold: bool,
+    pub is_italic: bool,
+    pub origin: f32,
+    pub angle: f32,
+    pub is_reverse: bool,
+    pub reverse_expansion: f32,
+    pub is_mirrored: bool,
+    pub is_locked: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Pad {
     pub id: String,
     pub group_id: u32,
@@ -841,6 +904,7 @@ pub enum FootprintProperty {
     RULE_TEMPLATE(RuleTemplate),
     RULE(Rule),
     PRIMITIVE(Primitive),
+    STRING(StringObject),
     ATTR(Attribute),
     CANVAS(Canvas),
 }
@@ -855,12 +919,12 @@ impl FootprintProperty {
         }
 
         let property_type = reader.read_string()
-            .ok_or_else(|| ParserError::InvalidPropertyType("Invalid type".to_string()))?;
+            .ok_or_else(|| ParserError::InvalidPropertyType(ParserType::Footprint, "Invalid type".to_string()))?;
 
         match property_type.as_str() {
             "DOCTYPE" => {
                 if reader.remaining() != 2 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
                 }
 
                 Ok(Some(FootprintProperty::DOCTYPE(DocType {
@@ -870,7 +934,7 @@ impl FootprintProperty {
             }
             "HEAD" => {
                 if reader.remaining() != 1 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
                 }
 
                 let parameters = reader.read_value().unwrap();
@@ -885,7 +949,7 @@ impl FootprintProperty {
             }
             "LAYER" => {
                 if reader.remaining() != 8 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
                 }
 
                 Ok(Some(FootprintProperty::LAYER(Layer {
@@ -901,7 +965,7 @@ impl FootprintProperty {
             }
             "LAYER_PHYS" => {
                 if reader.remaining() != 6 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
                 }
 
                 Ok(Some(FootprintProperty::LAYER_PHYS(PhysicalLayer {
@@ -915,14 +979,14 @@ impl FootprintProperty {
             }
             "ACTIVE_LAYER" => {
                 if reader.remaining() != 1 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
                 }
 
                 Ok(Some(FootprintProperty::ACTIVELAYER(reader.read_u8().unwrap())))
             }
             "FILL" => {
                 if reader.remaining() != 8 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
                 }
 
                 Ok(Some(FootprintProperty::FILL(Fill {
@@ -940,7 +1004,7 @@ impl FootprintProperty {
             }
             "POLY" => {
                 if reader.remaining() != 7 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
                 }
 
                 Ok(Some(FootprintProperty::POLY(Poly {
@@ -957,7 +1021,7 @@ impl FootprintProperty {
             }
             "PAD" => {
                 if reader.remaining() < 21 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
                 }
 
                 let mut pad = Pad {
@@ -1012,7 +1076,7 @@ impl FootprintProperty {
             }
             "NET" => {
                 if reader.remaining() != 7 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
                 }
 
                 Ok(Some(FootprintProperty::NET(Net {
@@ -1027,7 +1091,7 @@ impl FootprintProperty {
             }
             "RULE_TEMPLATE" => {
                 if reader.remaining() != 1 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
                 }
 
                 Ok(Some(FootprintProperty::RULE_TEMPLATE(RuleTemplate {
@@ -1036,7 +1100,7 @@ impl FootprintProperty {
             }
             "RULE" => {
                 if reader.remaining() != 4 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
                 }
 
                 Ok(Some(FootprintProperty::RULE(Rule {
@@ -1048,7 +1112,7 @@ impl FootprintProperty {
             }
             "PRIMITIVE" => {
                 if reader.remaining() != 3 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
                 }
 
                 Ok(Some(FootprintProperty::PRIMITIVE(Primitive {
@@ -1057,9 +1121,34 @@ impl FootprintProperty {
                     pick: reader.read_bool().unwrap(),
                 })))
             }
+            "STRING" => {
+                if reader.remaining() != 17 {
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
+                }
+
+                Ok(Some(FootprintProperty::STRING(StringObject {
+                    id: reader.read_string().unwrap(),
+                    group_id: reader.read_u32().unwrap(),
+                    layer_id: reader.read_u8().unwrap(),
+                    pos_x: reader.read_f32().unwrap(),
+                    pos_y: reader.read_f32().unwrap(),
+                    text: reader.read_string().unwrap(),
+                    font_family: reader.read_string().unwrap(),
+                    font_size: reader.read_f32().unwrap(),
+                    stroke_width: reader.read_f32().unwrap(),
+                    is_bold: reader.read_bool().unwrap(),
+                    is_italic: reader.read_bool().unwrap(),
+                    origin: reader.read_f32().unwrap(),
+                    angle: reader.read_f32().unwrap(),
+                    is_reverse: reader.read_bool().unwrap(),
+                    reverse_expansion: reader.read_f32().unwrap(),
+                    is_mirrored: reader.read_bool().unwrap(),
+                    is_locked: reader.read_bool().unwrap(),
+                })))
+            }
             "ATTR" => {
                 if reader.remaining() != 21 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
                 }
 
                 Ok(Some(FootprintProperty::ATTR(Attribute {
@@ -1088,7 +1177,7 @@ impl FootprintProperty {
             }
             "CANVAS" => {
                 if reader.remaining() < 7 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
                 }
 
                 let mut canvas = Canvas {
@@ -1125,7 +1214,7 @@ impl FootprintProperty {
                 Ok(Some(FootprintProperty::CANVAS(canvas)))
             }
             "RULE_SELECTOR" | "PREFERENCE" | "PANELIZE" | "PANELIZE_STAMP" | "PANELIZE_SIDE" | "SILK_OPTS" | "CONNECT" => Ok(None),
-            _ => Err(ParserError::InvalidPropertyType(property_type.to_string())),
+            _ => Err(ParserError::InvalidPropertyType(ParserType::Footprint, property_type.to_string())),
         }
     }
 }

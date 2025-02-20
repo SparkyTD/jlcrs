@@ -1,21 +1,15 @@
 use std::collections::HashMap;
+use itertools::Itertools;
+use crate::easyeda::json_reader::JsonArrayReader;
+use crate::easyeda::{ParserError, ParserType};
+use crate::kicad::model::common::{Font, FontSize, Position, StrokeDefinition, TextEffect, TextJustifyHorizontal, TextJustifyVertical, TextPosition};
+use crate::kicad::model::symbol_library::{Color, FillDefinition, FillType, PinElectricalType, PinGraphicStyle, StrokeType, Symbol, SymbolArc, SymbolCircle, SymbolLib, SymbolLine, SymbolPin, SymbolRectangle, SymbolText};
 use num_derive::FromPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::easyeda::json_reader::JsonArrayReader;
-use crate::easyeda::model::{ParserError};
-use crate::kicad::model::common::{Font, FontSize, Position, StrokeDefinition, TextEffect};
-use crate::kicad::model::symbol_library::{Color, FillDefinition, FillType, PinElectricalType, PinGraphicStyle, Property, StrokeType, Symbol, SymbolArc, SymbolCircle, SymbolLib, SymbolLine, SymbolPin, SymbolRectangle};
 
 pub struct EasyEDASymbol {
-    pub line_styles: HashMap<String, LineStyle>,
-    pub font_styles: HashMap<String, FontStyle>,
-    pub part: Part,
-    pub rectangles: HashMap<String, Rectangle>,
-    pub circles: HashMap<String, Circle>,
-    pub lines: HashMap<String, PolyLine>,
-    pub arcs: HashMap<String, Arc>,
-    pub pins: HashMap<String, Pin>,
+    pub elements: Vec<SymbolElement>,
 
     pub part_number: Option<String>,
 }
@@ -27,83 +21,25 @@ impl EasyEDASymbol {
     }
 
     pub fn parse(symbol_data: &str) -> anyhow::Result<EasyEDASymbol> {
-        let mut line_styles = HashMap::new();
-        let mut font_styles = HashMap::new();
-        let mut parts = HashMap::new();
-        let mut rectangles: HashMap<String, Rectangle> = HashMap::new();
-        let mut circles: HashMap<String, Circle> = HashMap::new();
-        let mut lines: HashMap<String, PolyLine> = HashMap::new();
-        let mut arcs: HashMap<String, Arc> = HashMap::new();
-        let mut pins: HashMap<String, Pin> = HashMap::new();
+        let mut elements = Vec::new();
 
         for param in symbol_data.split_terminator(['\r', '\n']) {
             if param.len() == 0 {
                 continue;
             }
 
-            let prop = SymbolProperty::parse_line(param)?;
+            let prop = SymbolElement::parse_line(param)?;
             if prop.is_none() {
                 continue;
             }
             let prop = prop.unwrap();
 
-            match prop {
-                SymbolProperty::DOCTYPE(doctype) => {
-                    assert_eq!(doctype.kind, "SYMBOL");
-                }
-                SymbolProperty::HEAD(_) => {}
-                SymbolProperty::LINESTYLE(line_style) => {
-                    line_styles.insert(line_style.index_name.clone(), line_style);
-                }
-                SymbolProperty::FONTSTYLE(font_style) => {
-                    font_styles.insert(font_style.index_name.clone(), font_style);
-                }
-                SymbolProperty::PART(part) => {
-                    parts.insert(part.id.clone(), part);
-                }
-                SymbolProperty::ATTR(attribute) => {
-                    if attribute.parent_id.is_none() {
-                        parts.values_mut().last().unwrap().attributes.push(attribute);
-                    } else if let Some(parent_id) = &attribute.parent_id {
-                        if let Some(rectangle) = rectangles.get_mut(parent_id) {
-                            rectangle.attributes.push(attribute);
-                        } else if let Some(circle) = circles.get_mut(parent_id) {
-                            circle.attributes.push(attribute);
-                        } else if let Some(pin) = pins.get_mut(parent_id) {
-                            pin.attributes.push(attribute);
-                        } else {
-                            panic!("Invalid symbol attribute: {:?}", attribute);
-                        }
-                    }
-                }
-                SymbolProperty::RECT(rect) => {
-                    rectangles.insert(rect.id.clone(), rect);
-                }
-                SymbolProperty::CIRCLE(circle) => {
-                    circles.insert(circle.id.clone(), circle);
-                }
-                SymbolProperty::POLYLINE(polyline) => {
-                    lines.insert(polyline.id.clone(), polyline);
-                }
-                SymbolProperty::ARC(arc) => {
-                    arcs.insert(arc.id.clone(), arc);
-                }
-                SymbolProperty::PIN(pin) => {
-                    pins.insert(pin.id.clone(), pin);
-                }
-            }
+            elements.push(prop);
         }
 
         Ok(Self {
-            part: parts.into_values().last().unwrap(),
             part_number: None,
-            line_styles,
-            font_styles,
-            rectangles,
-            circles,
-            lines,
-            arcs,
-            pins,
+            elements,
         })
     }
 }
@@ -121,12 +57,6 @@ impl Into<SymbolLib> for EasyEDASymbol {
 
 impl Into<Symbol> for EasyEDASymbol {
     fn into(self) -> Symbol {
-        let mut kicad_symbol = Symbol {
-            in_bom: true,
-            on_board: true,
-            ..Default::default()
-        };
-
         let default_text_effect = TextEffect {
             font: Font {
                 size: FontSize { width: 1.27, height: 1.27 },
@@ -137,87 +67,217 @@ impl Into<Symbol> for EasyEDASymbol {
 
         let scale_factor = 0.254;
 
-        kicad_symbol.symbol_id = self.part.id.clone();
+        let mut line_styles = HashMap::new();
+        let mut text_styles = HashMap::new();
+        let mut current_part = Part::default();
+        let mut attributes = Vec::new();
 
-        for (_, rectangle) in self.rectangles {
-            let line_style = self.line_styles.get(&rectangle.style_id.unwrap()).unwrap();
-            kicad_symbol.rectangles.push(SymbolRectangle {
-                start: Position { x: rectangle.x * scale_factor, y: rectangle.y * scale_factor, angle: None },
-                end: Position { x: rectangle.end_x * scale_factor, y: rectangle.end_y * scale_factor, angle: None },
-                stroke: StrokeDefinition {
-                    width: line_style.stroke_width.unwrap_or(0.254),
-                    color: line_style.stroke_color.clone().and_then(|s| Some(Color::from_hex(&s))),
-                    dash: Some(StrokeType::Solid),
-                },
-                fill: FillDefinition {
-                    fill_type: FillType::Background,
-                },
-            });
+        let all_parts = self.elements.iter()
+            .filter_map(|e| match e {
+                SymbolElement::PART(part) => Some(part),
+                _ => None,
+            }).collect_vec();
+        let is_complex_symbol = all_parts.len() > 1;
+
+        // root_symbol.symbol_id = "complex".into();
+
+        let mut all_symbols = Vec::new();
+        let mut current_symbol_index = usize::MAX;
+
+        // Extract all attributes
+        for element in &self.elements {
+            match element {
+                SymbolElement::ATTR(attribute) => {
+                    if let Some(_) = &attribute.parent_id {
+                        attributes.push(attribute.clone());
+                    }
+                }
+                _ => {}
+            }
         }
 
-        for (_, circle) in self.circles {
-            let line_style = self.line_styles.get(&circle.style_id.unwrap()).unwrap();
-            kicad_symbol.circles.push(SymbolCircle {
-                center: Position { x: circle.cx * scale_factor, y: circle.cy * scale_factor, angle: None },
-                radius: circle.radius * scale_factor,
-                stroke: StrokeDefinition {
-                    width: line_style.stroke_width.unwrap_or(0.254),
-                    color: line_style.stroke_color.clone().and_then(|s| Some(Color::from_hex(&s))),
-                    dash: Some(StrokeType::Solid),
-                },
-                fill: FillDefinition {
-                    fill_type: FillType::Outline,
-                },
-            });
+        // Parse and convert elements
+        for element in self.elements {
+            let attribute_key = match &element {
+                SymbolElement::ATTR(e) => Some(e.id.clone()),
+                SymbolElement::PART(e) => Some(e.id.clone()),
+                SymbolElement::RECT(e) => Some(e.id.clone()),
+                SymbolElement::CIRCLE(e) => Some(e.id.clone()),
+                SymbolElement::POLYLINE(e) => Some(e.id.clone()),
+                SymbolElement::ARC(e) => Some(e.id.clone()),
+                SymbolElement::TEXT(e) => Some(e.id.clone()),
+                SymbolElement::PIN(e) => Some(e.id.clone()),
+
+                _ => None
+            };
+            let attributes = attributes.iter().filter(|f| f.parent_id == attribute_key).collect_vec();
+
+            match element {
+                SymbolElement::LINESTYLE(style) => {
+                    line_styles.insert(style.index_name.clone(), style);
+                }
+                SymbolElement::FONTSTYLE(style) => {
+                    text_styles.insert(style.index_name.clone(), style);
+                }
+                SymbolElement::PART(part) => {
+                    // current_symbol.symbol_id = part.id.clone();
+                    let symbol = Symbol {
+                        symbol_id: part.id.clone(),
+                        in_bom: Some(true),
+                        on_board: Some(true),
+                        ..Default::default()
+                    };
+                    all_symbols.push(symbol);
+                    current_symbol_index = all_symbols.len() - 1;
+                    current_part = part;
+                }
+                SymbolElement::ATTR(attr) => {
+                    match attr.parent_id {
+                        None => current_part.attributes.push(attr),
+                        _ => {}
+                    }
+                }
+                SymbolElement::RECT(rectangle) => {
+                    let current_symbol = all_symbols.get_mut(current_symbol_index).unwrap();
+                    let line_style = line_styles.get(&rectangle.style_id.unwrap()).unwrap();
+                    current_symbol.rectangles.push(SymbolRectangle {
+                        start: Position { x: rectangle.x * scale_factor, y: rectangle.y * scale_factor, angle: None },
+                        end: Position { x: rectangle.end_x * scale_factor, y: rectangle.end_y * scale_factor, angle: None },
+                        stroke: StrokeDefinition {
+                            width: line_style.stroke_width.unwrap_or(0.254),
+                            color: line_style.stroke_color.clone().and_then(|s| Some(Color::from_hex(&s))),
+                            dash: Some(StrokeType::Solid),
+                        },
+                        fill: FillDefinition {
+                            fill_type: FillType::Background,
+                        },
+                    });
+                }
+                SymbolElement::CIRCLE(circle) => {
+                    let current_symbol = all_symbols.get_mut(current_symbol_index).unwrap();
+                    let line_style = line_styles.get(&circle.style_id.unwrap()).unwrap();
+                    current_symbol.circles.push(SymbolCircle {
+                        center: Position { x: circle.cx * scale_factor, y: circle.cy * scale_factor, angle: None },
+                        radius: circle.radius * scale_factor,
+                        stroke: StrokeDefinition {
+                            width: line_style.stroke_width.unwrap_or(0.254),
+                            color: line_style.stroke_color.clone().and_then(|s| Some(Color::from_hex(&s))),
+                            dash: Some(StrokeType::Solid),
+                        },
+                        fill: FillDefinition {
+                            fill_type: FillType::Outline,
+                        },
+                    });
+                }
+                SymbolElement::ELLIPSE(ellipse) => {
+                    let current_symbol = all_symbols.get_mut(current_symbol_index).unwrap();
+                    let line_style = line_styles.get(&ellipse.style_id.unwrap()).unwrap();
+                    if ellipse.radius_x == ellipse.radius_y {
+                        current_symbol.circles.push(SymbolCircle {
+                            center: Position { x: ellipse.cx * scale_factor, y: ellipse.cy * scale_factor, angle: None },
+                            radius: ellipse.radius_x * scale_factor,
+                            stroke: StrokeDefinition {
+                                width: line_style.stroke_width.unwrap_or(0.254),
+                                color: line_style.stroke_color.clone().and_then(|s| Some(Color::from_hex(&s))),
+                                dash: Some(StrokeType::Solid),
+                            },
+                            fill: FillDefinition {
+                                fill_type: FillType::Outline,
+                            },
+                        });
+                    } else {
+                        panic!("Ellipses are not supported by KiCAD");
+                    }
+                }
+                SymbolElement::POLYLINE(line) => {
+                    let current_symbol = all_symbols.get_mut(current_symbol_index).unwrap();
+                    let line_style = line_styles.get(&line.style_id.unwrap()).unwrap();
+                    current_symbol.lines.push(SymbolLine {
+                        points: line.points.iter().map(|p| Position { x: p.0 * scale_factor, y: p.1 * scale_factor, angle: None }).collect(),
+                        stroke: StrokeDefinition {
+                            width: line_style.stroke_width.unwrap_or(0.254),
+                            color: line_style.stroke_color.clone().and_then(|s| Some(Color::from_hex(&s))),
+                            dash: Some(StrokeType::Solid),
+                        },
+                        fill: Some(FillDefinition {
+                            fill_type: FillType::None,
+                        }),
+                    });
+                }
+                SymbolElement::ARC(arc) => {
+                    let current_symbol = all_symbols.get_mut(current_symbol_index).unwrap();
+                    let line_style = line_styles.get(&arc.style_id.unwrap()).unwrap();
+                    current_symbol.arcs.push(SymbolArc {
+                        start: Position { x: arc.x1 * scale_factor, y: arc.y1 * scale_factor, angle: None },
+                        mid: Position { x: arc.x2 * scale_factor, y: arc.y2 * scale_factor, angle: None },
+                        end: Position { x: arc.x3 * scale_factor, y: arc.y3 * scale_factor, angle: None },
+                        stroke: StrokeDefinition {
+                            width: line_style.stroke_width.unwrap_or(0.254),
+                            color: line_style.stroke_color.clone().and_then(|s| Some(Color::from_hex(&s))),
+                            dash: Some(StrokeType::Solid),
+                        },
+                        fill: FillDefinition {
+                            fill_type: FillType::None,
+                        },
+                    });
+                }
+                SymbolElement::TEXT(text) => {
+                    let current_symbol = all_symbols.get_mut(current_symbol_index).unwrap();
+                    let mut text_style = default_text_effect.clone();
+                    if let Some(style) = text.style_id.and_then(|id| text_styles.get(&id)) {
+                        text_style.font.bold = style.is_bold.is_some_and(|b| b);
+                        text_style.font.italic = style.is_italic.is_some_and(|b| b);
+
+                        if let Some(size) = style.font_size {
+                            text_style.font.size = FontSize {
+                                width: size * scale_factor * 0.5,
+                                height: size * scale_factor * 0.5,
+                            }
+                        }
+
+                        text_style.justify.justify_horizontal = style.h_align.map(|a| match a {
+                            0 | 1 => TextJustifyHorizontal::Left,
+                            _ => TextJustifyHorizontal::Right,
+                        });
+
+                        text_style.justify.justify_vertical = style.v_align.map(|a| match a {
+                            0 | 1 => TextJustifyVertical::Top,
+                            _ => TextJustifyVertical::Bottom,
+                        });
+                    }
+
+                    current_symbol.texts.push(SymbolText {
+                        text: text.text,
+                        position: TextPosition { x: text.x * scale_factor, y: text.y * scale_factor, angle: Some(text.rotation) },
+                        effects: text_style,
+                    });
+                }
+                SymbolElement::PIN(pin) => {
+                    let current_symbol = all_symbols.get_mut(current_symbol_index).unwrap();
+                    let name = attributes.iter().filter(|a| a.key == "NAME").last().unwrap();
+                    let number = attributes.iter().filter(|a| a.key == "NUMBER").last().unwrap();
+                    current_symbol.pins.push(SymbolPin {
+                        position: Position { x: pin.x * scale_factor, y: pin.y * scale_factor, angle: Some(pin.rotation) },
+                        length: pin.length * scale_factor,
+                        number: Some(number.value.clone().unwrap()),
+                        name: Some(name.value.clone().unwrap()),
+                        name_effects: default_text_effect.clone(),
+                        number_effects: default_text_effect.clone(),
+                        graphic_style: match pin.pin_shape {
+                            PinShape::None => PinGraphicStyle::Line,
+                            PinShape::Clock => PinGraphicStyle::Clock,
+                            PinShape::Inverted => PinGraphicStyle::Inverted,
+                            PinShape::InvertedClock => PinGraphicStyle::InvertedClock,
+                        },
+                        electrical_type: PinElectricalType::Unspecified,
+                    });
+                }
+
+                SymbolElement::DOCTYPE(_) | SymbolElement::HEAD(_) => {}
+            }
         }
 
-        for (_, line) in self.lines {
-            let line_style = self.line_styles.get(&line.style_id.unwrap()).unwrap();
-            kicad_symbol.lines.push(SymbolLine {
-                points: line.points.iter().map(|p| Position { x: p.0 * scale_factor, y: p.1 * scale_factor, angle: None }).collect(),
-                stroke: StrokeDefinition {
-                    width: line_style.stroke_width.unwrap_or(0.254),
-                    color: line_style.stroke_color.clone().and_then(|s| Some(Color::from_hex(&s))),
-                    dash: Some(StrokeType::Solid),
-                },
-                fill: Some(FillDefinition {
-                    fill_type: FillType::None,
-                }),
-            });
-        }
-
-        for (_, arc) in self.arcs {
-            let line_style = self.line_styles.get(&arc.style_id.unwrap()).unwrap();
-            kicad_symbol.arcs.push(SymbolArc {
-                start: Position { x: arc.x1 * scale_factor, y: arc.y1 * scale_factor, angle: None },
-                mid: Position { x: arc.x2 * scale_factor, y: arc.y2 * scale_factor, angle: None },
-                end: Position { x: arc.x3 * scale_factor, y: arc.y3 * scale_factor, angle: None },
-                stroke: StrokeDefinition {
-                    width: line_style.stroke_width.unwrap_or(0.254),
-                    color: line_style.stroke_color.clone().and_then(|s| Some(Color::from_hex(&s))),
-                    dash: Some(StrokeType::Solid),
-                },
-                fill: FillDefinition {
-                    fill_type: FillType::None,
-                },
-            });
-        }
-
-        for (_, pin) in self.pins {
-            let name = pin.attributes.iter().filter(|a| a.key == "NAME").last().unwrap();
-            let number = pin.attributes.iter().filter(|a| a.key == "NUMBER").last().unwrap();
-            kicad_symbol.pins.push(SymbolPin {
-                position: Position { x: pin.x * scale_factor, y: pin.y * scale_factor, angle: Some(pin.rotation) },
-                length: pin.length * scale_factor,
-                number: Some(number.value.clone().unwrap()),
-                name: Some(name.value.clone().unwrap()),
-                name_effects: default_text_effect.clone(),
-                number_effects: default_text_effect.clone(),
-                graphic_style: PinGraphicStyle::Line,
-                electrical_type: PinElectricalType::Unspecified,
-            });
-        }
-
+        // todo
         if let Some(part_number) = self.part_number {
             /*kicad_symbol.properties.push(Property {
                 id: None,
@@ -229,7 +289,63 @@ impl Into<Symbol> for EasyEDASymbol {
             });*/
         }
 
-        kicad_symbol
+        let mut root_symbol = Symbol {
+            in_bom: Some(true),
+            on_board: Some(true),
+            ..Default::default()
+        };
+
+        if is_complex_symbol {
+            let unit_symbol_names = all_symbols.iter()
+                .map(|s| s.symbol_id.clone())
+                .collect_vec();
+            let name_parts = unit_symbol_names.iter()
+                .map(|s| match s.rfind('.') {
+                    Some(index) => Some((s[..index].to_string(), s[index + 1..].parse::<usize>())),
+                    None => None,
+                }).collect_vec();
+
+            // Check overall sequence formatting
+            if name_parts.iter().any(|p| p.clone().is_none_or(|(_, id)| id.is_err())) {
+                panic!("One or more symbol sub-unit names are incorrectly formatted.")
+            }
+
+            let name_parts = name_parts.into_iter()
+                .map(|p| (p.clone().unwrap().0, p.unwrap().1.unwrap()))
+                .collect_vec();
+
+            // Check number sequence suffixes
+            let sequence_okay = name_parts.iter()
+                .map(|p| p.1).zip_eq(1..name_parts.len() + 1)
+                .all(|(a, b)| a == b);
+            if !sequence_okay {
+                panic!("One or more symbol sub-unit names have an incorrect numeric identifier.")
+            }
+
+            // Check base part matches
+            if !name_parts.windows(2).all(|w| w[0].0 == w[1].0) {
+                panic!("One or more symbol sub-unit names have an incorrect name.")
+            }
+
+            root_symbol.symbol_id = name_parts.first().unwrap().0.clone();
+            let mut unit_index = 1;
+            for mut unit_symbol in all_symbols {
+                unit_symbol.symbol_id = format!("{}_{}_1", root_symbol.symbol_id, unit_index);
+                unit_symbol.in_bom = None;
+                unit_symbol.on_board = None;
+                root_symbol.units.push(unit_symbol);
+                unit_index += 1;
+            }
+        } else {
+            let mut symbol = all_symbols.pop().unwrap();
+            symbol.in_bom = Some(true);
+            symbol.on_board = Some(true);
+            root_symbol = symbol;
+        }
+
+        // todo add basic properties to root
+
+        root_symbol
     }
 }
 
@@ -272,7 +388,7 @@ pub struct FontStyle {
     pub h_align: Option<u8>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Part {
     pub id: String,
     pub bbox_x: f32,
@@ -283,7 +399,7 @@ pub struct Part {
     pub attributes: Vec<Attribute>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct Attribute {
     pub id: String,
     pub parent_id: Option<String>,
@@ -310,8 +426,6 @@ pub struct Rectangle {
     pub rotation: f32,
     pub style_id: Option<String>,
     pub is_locked: bool,
-
-    pub attributes: Vec<Attribute>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -322,8 +436,18 @@ pub struct Circle {
     pub radius: f32,
     pub style_id: Option<String>,
     pub is_locked: bool,
+}
 
-    pub attributes: Vec<Attribute>,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Ellipse {
+    pub id: String,
+    pub cx: f32,
+    pub cy: f32,
+    pub radius_x: f32,
+    pub radius_y: f32,
+    pub unknown: Value,
+    pub style_id: Option<String>,
+    pub is_locked: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -368,12 +492,21 @@ pub struct Pin {
     pub pin_color: Option<String>,
     pub pin_shape: PinShape,
     pub is_locked: bool,
-
-    pub attributes: Vec<Attribute>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum SymbolProperty {
+pub struct Text {
+    pub id: String,
+    pub x: f32,
+    pub y: f32,
+    pub rotation: f32,
+    pub text: String,
+    pub style_id: Option<String>,
+    pub is_locked: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum SymbolElement {
     DOCTYPE(DocType),
     HEAD(Head),
     LINESTYLE(LineStyle),
@@ -382,12 +515,20 @@ pub enum SymbolProperty {
     ATTR(Attribute),
     RECT(Rectangle),
     CIRCLE(Circle),
+    ELLIPSE(Ellipse),
     POLYLINE(PolyLine),
     ARC(Arc),
     PIN(Pin),
+    TEXT(Text),
 }
 
-impl SymbolProperty {
+trait HasAttributes {
+    fn get_id(&self) -> &str;
+    fn get_attributes(&self) -> &Vec<Attribute>;
+    fn get_attributes_mut(&mut self) -> &mut Vec<Attribute>;
+}
+
+impl SymbolElement {
     pub fn parse_line(line: &str) -> Result<Option<Self>, ParserError> {
         let array: Vec<Value> = serde_json::from_str(line)?;
         let mut reader = JsonArrayReader::new(array);
@@ -397,39 +538,39 @@ impl SymbolProperty {
         }
 
         let property_type = reader.read_string()
-            .ok_or_else(|| ParserError::InvalidPropertyType("Invalid type".to_string()))?;
+            .ok_or_else(|| ParserError::InvalidPropertyType(ParserType::Symbol, "Invalid type".to_string()))?;
 
         match property_type.as_str() {
             "DOCTYPE" => {
                 if reader.remaining() != 2 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
                 }
 
-                Ok(Some(SymbolProperty::DOCTYPE(DocType {
+                Ok(Some(SymbolElement::DOCTYPE(DocType {
                     kind: reader.read_string().unwrap(),
                     version: reader.read_string().unwrap(),
                 })))
             }
             "HEAD" => {
                 if reader.remaining() != 1 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
                 }
 
                 let parameters = reader.read_value().unwrap();
 
-                Ok(Some(SymbolProperty::HEAD(Head {
-                    symbol_type: parameters["symbolType"].to_string().parse::<u32>().map_err(|e| ParserError::FormatError(e.to_string()))?,
+                Ok(Some(SymbolElement::HEAD(Head {
+                    symbol_type: parameters["symbolType"].to_string().parse::<u32>().map_err(|e| ParserError::FormatError(ParserType::Symbol, e.to_string()))?,
                     version: parameters["version"].as_str().unwrap().to_string(),
-                    origin_x: parameters["originX"].to_string().parse::<f32>().map_err(|e| ParserError::FormatError(e.to_string()))?,
-                    origin_y: parameters["originY"].to_string().parse::<f32>().map_err(|e| ParserError::FormatError(e.to_string()))?,
+                    origin_x: parameters["originX"].to_string().parse::<f32>().map_err(|e| ParserError::FormatError(ParserType::Symbol, e.to_string()))?,
+                    origin_y: parameters["originY"].to_string().parse::<f32>().map_err(|e| ParserError::FormatError(ParserType::Symbol, e.to_string()))?,
                 })))
             }
             "LINESTYLE" => {
                 if reader.remaining() != 6 && reader.remaining() != 5 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
                 }
 
-                Ok(Some(SymbolProperty::LINESTYLE(LineStyle {
+                Ok(Some(SymbolElement::LINESTYLE(LineStyle {
                     index_name: reader.read_string().unwrap(),
                     stroke_color: reader.read_string(),
                     stroke_style: reader.read_u8(),
@@ -440,10 +581,10 @@ impl SymbolProperty {
             }
             "FONTSTYLE" => {
                 if reader.remaining() != 11 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
                 }
 
-                Ok(Some(SymbolProperty::FONTSTYLE(FontStyle {
+                Ok(Some(SymbolElement::FONTSTYLE(FontStyle {
                     index_name: reader.read_string().unwrap(),
                     fill_color: reader.read_string(),
                     color: reader.read_string(),
@@ -459,14 +600,14 @@ impl SymbolProperty {
             }
             "PART" => {
                 if reader.remaining() != 2 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
                 }
 
                 let id = reader.read_string().unwrap();
                 let bbox = reader.read_value().unwrap();
                 let bbox: Vec<Value> = bbox["BBOX"].as_array().unwrap().to_vec();
 
-                Ok(Some(SymbolProperty::PART(Part {
+                Ok(Some(SymbolElement::PART(Part {
                     id,
                     bbox_x: bbox[0].as_f64().map(|f| f as f32).unwrap(),
                     bbox_y: bbox[1].as_f64().map(|f| f as f32).unwrap(),
@@ -478,10 +619,10 @@ impl SymbolProperty {
             }
             "ATTR" => {
                 if reader.remaining() != 11 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
                 }
 
-                Ok(Some(SymbolProperty::ATTR(Attribute {
+                Ok(Some(SymbolElement::ATTR(Attribute {
                     id: reader.read_string().unwrap(),
                     parent_id: reader.read_string().and_then(|s| if s.len() == 0 { None } else { Some(s.to_string()) }),
                     key: reader.read_string().unwrap(),
@@ -497,10 +638,10 @@ impl SymbolProperty {
             }
             "RECT" => {
                 if reader.remaining() != 10 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
                 }
 
-                Ok(Some(SymbolProperty::RECT(Rectangle {
+                Ok(Some(SymbolElement::RECT(Rectangle {
                     id: reader.read_string().unwrap(),
                     x: reader.read_f32().unwrap(),
                     y: reader.read_f32().unwrap(),
@@ -511,36 +652,48 @@ impl SymbolProperty {
                     rotation: reader.read_f32().unwrap(),
                     style_id: reader.read_string(),
                     is_locked: reader.read_bool().unwrap(),
-
-                    attributes: Vec::new(),
                 })))
             }
             "CIRCLE" => {
                 if reader.remaining() != 6 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
                 }
 
-                Ok(Some(SymbolProperty::CIRCLE(Circle {
+                Ok(Some(SymbolElement::CIRCLE(Circle {
                     id: reader.read_string().unwrap(),
                     cx: reader.read_f32().unwrap(),
                     cy: reader.read_f32().unwrap(),
                     radius: reader.read_f32().unwrap(),
                     style_id: reader.read_string(),
                     is_locked: reader.read_bool().unwrap(),
+                })))
+            }
+            "ELLIPSE" => {
+                if reader.remaining() != 8 {
+                    return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
+                }
 
-                    attributes: Vec::new(),
+                Ok(Some(SymbolElement::ELLIPSE(Ellipse {
+                    id: reader.read_string().unwrap(),
+                    cx: reader.read_f32().unwrap(),
+                    cy: reader.read_f32().unwrap(),
+                    radius_x: reader.read_f32().unwrap(),
+                    radius_y: reader.read_f32().unwrap(),
+                    unknown: reader.read_value().unwrap(),
+                    style_id: reader.read_string(),
+                    is_locked: reader.read_bool().unwrap(),
                 })))
             }
             "POLY" => {
                 if reader.remaining() != 5 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
                 }
 
                 let id = reader.read_string().unwrap();
                 let point_array = reader.read_value().unwrap();
                 let point_array = point_array.as_array().unwrap();
 
-                Ok(Some(SymbolProperty::POLYLINE(PolyLine {
+                Ok(Some(SymbolElement::POLYLINE(PolyLine {
                     id,
                     points: point_array.chunks(2)
                         .map(|a| (a[0].as_f64().unwrap() as f32, a[1].as_f64().unwrap() as f32))
@@ -552,10 +705,10 @@ impl SymbolProperty {
             }
             "ARC" => {
                 if reader.remaining() != 9 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+                    return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
                 }
 
-                Ok(Some(SymbolProperty::ARC(Arc {
+                Ok(Some(SymbolElement::ARC(Arc {
                     id: reader.read_string().unwrap(),
                     x1: reader.read_f32().unwrap(),
                     y1: reader.read_f32().unwrap(),
@@ -567,12 +720,27 @@ impl SymbolProperty {
                     is_locked: reader.read_bool().unwrap(),
                 })))
             }
-            "PIN" => {
-                if reader.remaining() != 11 {
-                    return Err(ParserError::InvalidArrayLength(property_type.into()));
+            "TEXT" => {
+                if reader.remaining() != 6 {
+                    return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
                 }
 
-                Ok(Some(SymbolProperty::PIN(Pin {
+                Ok(Some(SymbolElement::TEXT(Text {
+                    id: reader.read_string().unwrap(),
+                    x: reader.read_f32().unwrap(),
+                    y: reader.read_f32().unwrap(),
+                    rotation: reader.read_f32().unwrap(),
+                    text: reader.read_string().unwrap(),
+                    style_id: reader.read_string(),
+                    is_locked: reader.can_read() && reader.read_bool().is_some_and(|b| b),
+                })))
+            }
+            "PIN" => {
+                if reader.remaining() != 11 {
+                    return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
+                }
+
+                Ok(Some(SymbolElement::PIN(Pin {
                     id: reader.read_string().unwrap(),
                     display: reader.read_bool().unwrap(),
                     electric: reader.read_bool(),
@@ -583,11 +751,9 @@ impl SymbolProperty {
                     pin_color: reader.read_string(),
                     pin_shape: reader.read_enum().unwrap(),
                     is_locked: reader.read_bool().unwrap(),
-
-                    attributes: Vec::new(),
                 })))
             }
-            _ => Err(ParserError::InvalidPropertyType(property_type.to_string())),
+            _ => Err(ParserError::InvalidPropertyType(ParserType::Symbol, property_type.to_string())),
         }
     }
 }

@@ -1,13 +1,13 @@
-use std::fs;
+use crate::easyeda::footprint::EasyEDAFootprint;
+use crate::easyeda::symbol::SymbolElement;
+use crate::kicad::model::symbol_library::SymbolLib;
 use actix_web::{post, web, App, HttpResponse, HttpServer, Responder};
-use crate::easyeda::symbol::EasyEDASymbol;
 use kicad::model::footprint_library::FootprintLibrary;
 use kicad::syntax::SyntaxItemSerializable;
 use kicad::syntax::{KiCadParser, TopLevelSerializable};
 use proc_macro2::TokenStream;
+use std::fs;
 use svg::node::NodeClone;
-use crate::easyeda::footprint::EasyEDAFootprint;
-use crate::kicad::model::symbol_library::SymbolLib;
 
 mod kicad;
 mod easyeda;
@@ -39,23 +39,10 @@ pub fn test_derive(input: TokenStream) -> TokenStream {
     input
 }
 
-fn main1() -> anyhow::Result<()> {
-    // /home/sparky/Downloads/HF49FD_024-1H12T/KiCad/HF49FD0241H12T.kicad_mod
+fn main7() -> anyhow::Result<()> {
+    let test_input_sym = fs::read_to_string("/home/sparky/HardwareProjects/iot-controller/lfxp2-5e-5tn144.kicad_sym")?;
 
-    let all_files = fs::read_dir("/home/sparky/Downloads/JLCPCB-KiCad-Library-2025.01.22/footprints/JLCPCB.pretty")?;
-    // let all_files = fs::read_dir("/home/sparky/HardwareProjects/iot-controller/library/snapeda/Footprints.pretty")?;
-    for entry in all_files.map(|f| f.unwrap()) {
-        if entry.path().extension().unwrap().to_str().unwrap() != "kicad_mod" {
-            continue;
-        }
-
-        let test_input = fs::read_to_string(&entry.path())?;
-        println!("Testing: {}", entry.path().display());
-        test_parse_file::<FootprintLibrary>(&test_input)?;
-    }
-
-    //test_parse_file::<SymbolLib>(&test_input)?;
-    //test_parse_file::<FootprintLibrary>(&test_input)?;
+    test_parse_file::<SymbolLib>(&test_input_sym)?;
 
     Ok(())
 }
@@ -80,9 +67,27 @@ fn main() -> anyhow::Result<()> {
     // [OK] C318884 - SMD Button - TS-1187A-B-A-B
     // [OK] C2874116 - RGB LED - NH-B2020RGBA-HF
     // [OK] C841386 - DC-Dc Regulator TPS56637RPA
-    let (symbol, footprint) = download_component("C165948")?;
+    let (mut symbol, footprint) = easyeda::tests::download_component("C136421")?;
 
-    let kicad_symbol_lib: SymbolLib = symbol.into();
+    let is_complex_symbol = symbol.elements.iter()
+        .filter(|e| match e {
+            SymbolElement::PART(_) => true,
+            _ => false,
+        })
+        .count() > 1;
+    let mut index = 1;
+    for element in &mut symbol.elements {
+        match element {
+            SymbolElement::PART(part) => {
+                part.id = if is_complex_symbol { format!("test.{}", index) } else { "test".into() };
+                index += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let mut kicad_symbol_lib: SymbolLib = symbol.into();
+
     let item = kicad_symbol_lib.serialize();
     let tokens = KiCadParser::generate_tokens(&item);
     let sym_string = KiCadParser::stringify_tokens::<SymbolLib>(&tokens);
@@ -96,7 +101,7 @@ fn main() -> anyhow::Result<()> {
     //println!("{}", fp_string);
     fs::write("/home/sparky/HardwareProjects/iot-controller/test-library.pretty/test-footprint.kicad_mod", fp_string)?;
 
-    println!("{}", sym_string);
+    //println!("{}", sym_string);
     fs::write("/home/sparky/HardwareProjects/iot-controller/test-symbol.kicad_sym", sym_string)?;
 
     println!("All done!");
@@ -114,12 +119,11 @@ async fn handle_footprint(body: web::Bytes) -> HttpResponse {
             let item = kicad_footprint.serialize();
             let tokens = KiCadParser::generate_tokens(&item);
             let string = KiCadParser::stringify_tokens::<SymbolLib>(&tokens);
-            println!("{}", string);
+            // println!("{}", string);
 
             fs::write("/home/sparky/HardwareProjects/iot-controller/test-library.pretty/test-footprint.kicad_mod", string).unwrap();
 
             println!("All done!");
-
         }
         Err(err) => {
             println!("Footprint parse error: {}", err);
@@ -129,28 +133,11 @@ async fn handle_footprint(body: web::Bytes) -> HttpResponse {
     HttpResponse::Ok().await.unwrap()
 }
 
-//#[tokio::main]
-async fn main2() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main3() -> anyhow::Result<()> {
     HttpServer::new(|| {
         App::new().service(handle_footprint)
-    }).bind(("127.0.0.1", 8088))?.run().await?;
+    }).bind(("127.0.0.1", 8089))?.run().await?;
 
     Ok(())
-}
-
-fn download_component(code: &str) -> anyhow::Result<(EasyEDASymbol, EasyEDAFootprint)> {
-    let response = ureq::get(
-        format!("https://pro.easyeda.com/api/eda/product/search?keyword={}&currPage=1&pageSize=1", code)
-    ).call()?;
-
-    let body_string = response.into_body().read_to_string()?;
-    let json = serde_json::from_str::<serde_json::Value>(&body_string)?;
-    let data = &json["result"]["productList"][0]["device_info"];
-    let mut symbol = EasyEDASymbol::parse(&data["symbol_info"]["dataStr"].as_str().unwrap())?;
-    let mut footprint = EasyEDAFootprint::parse(&data["footprint_info"]["dataStr"].as_str().unwrap())?;
-
-    symbol.part_number = Some(code.into());
-    footprint.part_number = Some(code.into());
-
-    Ok((symbol, footprint))
 }

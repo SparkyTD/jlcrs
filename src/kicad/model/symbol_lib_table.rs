@@ -1,4 +1,4 @@
-use crate::kicad::syntax::{PositionPreference, SyntaxArgument, SyntaxItem, SyntaxItemSerializable};
+use crate::kicad::syntax::{PositionPreference, SyntaxArgument, SyntaxItem, SyntaxItemSerializable, TopLevelSerializable};
 
 #[derive(Debug, Default)]
 pub struct SymbolLibTable {
@@ -15,6 +15,14 @@ pub struct SymbolLibTableItem {
     pub description: String,
     pub disabled: bool,
     pub hidden: bool,
+}
+
+impl TopLevelSerializable for SymbolLibTable {
+    fn get_same_line_identifiers() -> Vec<String> {
+        Vec::from([
+            "name", "type", "uri", "options", "descr", "disabled", "hidden",
+        ]).iter().map(|s| s.to_string()).collect()
+    }
 }
 
 impl SyntaxItemSerializable for SymbolLibTable {
@@ -52,7 +60,7 @@ impl SyntaxItemSerializable for SymbolLibTableItem {
             SyntaxItem::from_single_argument("uri", SyntaxArgument::QuotedString(self.uri.clone(), PositionPreference::None)),
             SyntaxItem::from_single_argument("type", SyntaxArgument::QuotedString(self.lib_type.clone(), PositionPreference::None)),
             SyntaxItem::from_single_argument("options", SyntaxArgument::QuotedString(self.options.clone(), PositionPreference::None)),
-            SyntaxItem::from_single_argument("description", SyntaxArgument::QuotedString(self.description.clone(), PositionPreference::None)),
+            SyntaxItem::from_single_argument("descr", SyntaxArgument::QuotedString(self.description.clone(), PositionPreference::None)),
         ];
 
         if self.disabled {
@@ -77,8 +85,8 @@ impl SyntaxItemSerializable for SymbolLibTableItem {
             lib_type: syntax.get_named_child("type").unwrap().arguments.first().unwrap().get_string(),
             options: syntax.get_named_child("options").unwrap().arguments.first().unwrap().get_string(),
             description: syntax.get_named_child("descr").unwrap().arguments.first().unwrap().get_string(),
-            disabled: syntax.get_named_child("disabled").unwrap().arguments.first().is_some(),
-            hidden: syntax.get_named_child("hidden").unwrap().arguments.first().is_some()
+            disabled: syntax.get_named_child("disabled").is_some(),
+            hidden: syntax.get_named_child("hidden").is_some(),
         }
     }
 }

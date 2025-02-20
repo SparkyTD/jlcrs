@@ -76,7 +76,9 @@ impl SyntaxItem {
         }
 
         if self.arguments.len() != other.arguments.len() && self.name != "layers" {
-            return false;
+            if !(self.name == "effects" && other.name == "effects" && other.children.len() == self.arguments.len() + self.children.len()) {
+                return false;
+            }
         }
 
         let this_children = self.children.iter().sorted_by_key(|e| e.name.clone()).collect_vec();
@@ -90,19 +92,24 @@ impl SyntaxItem {
             println!(">>> Mismatched child count in {}", self.name);
             println!("    self: {:?}", this_children.iter().map(|c| c.name.clone()).collect_vec());
             println!("   other: {:?}", other_children.iter().map(|c| c.name.clone()).collect_vec());
-            return false;
-        }
 
-        for i in 0..this_children.len() {
-            let this = this_children.get(i).unwrap();
-            let other = other_children.get(i).unwrap();
-            if !this.deep_equals(other) {
+            if self.name != "effects" {
                 return false;
             }
         }
 
+        if self.name != "effects" {
+            for i in 0..this_children.len() {
+                let this = this_children.get(i).unwrap();
+                let other = other_children.get(i).unwrap();
+                if !this.deep_equals(other) {
+                    return false;
+                }
+            }
+        }
+
         if self.name != "layers" {
-            for i in 0..self.arguments.len() {
+            for i in 0..self.arguments.len().min(other.arguments.len()) {
                 let this = self.arguments.get(i).unwrap();
                 let other = other.arguments.get(i).unwrap();
                 if this.get_string() != other.get_string() {

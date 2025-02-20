@@ -1,4 +1,4 @@
-use crate::kicad::model::common::{Id, Position, StrokeDefinition, TextEffect};
+use crate::kicad::model::common::{Id, Position, StrokeDefinition, TextEffect, TextPosition};
 use crate::kicad::syntax::{PositionPreference, SyntaxArgument, SyntaxItem, SyntaxItemSerializable, TopLevelSerializable};
 
 #[derive(Debug)]
@@ -16,8 +16,9 @@ pub struct Symbol {
     pub pin_numbers_hidden: bool,
     pub pin_names_hidden: bool,
     pub pin_names_offset: Option<f32>,
-    pub in_bom: bool,
-    pub on_board: bool,
+    pub in_bom: Option<bool>,
+    pub on_board: Option<bool>,
+    pub exclude_from_sim: Option<bool>,
     pub properties: Vec<Property>,
 
     pub arcs: Vec<SymbolArc>,
@@ -74,7 +75,7 @@ pub struct SymbolCurve {
 #[derive(Debug)]
 pub struct SymbolText {
     pub text: String,
-    pub position: Position,
+    pub position: TextPosition,
     pub effects: TextEffect,
 }
 
@@ -257,11 +258,11 @@ impl SyntaxItemSerializable for Symbol {
         if self.pin_numbers_hidden {
             children.push(SyntaxItem::from_single_argument("pin_numbers", SyntaxArgument::Identifier("hidden".into(), PositionPreference::None)))
         }
-        if self.in_bom {
-            children.push(SyntaxItem::from_single_argument("in_bom", SyntaxArgument::Identifier(if self.in_bom { "yes".into() } else { "no".into() }, PositionPreference::None)));
+        if let Some(in_bom) = self.in_bom {
+            children.push(SyntaxItem::from_single_argument("in_bom", SyntaxArgument::Identifier(if in_bom { "yes".into() } else { "no".into() }, PositionPreference::None)));
         }
-        if self.on_board {
-            children.push(SyntaxItem::from_single_argument("on_board", SyntaxArgument::Identifier(if self.on_board { "yes".into() } else { "no".into() }, PositionPreference::None)));
+        if let Some(on_board) = self.on_board {
+            children.push(SyntaxItem::from_single_argument("on_board", SyntaxArgument::Identifier(if on_board { "yes".into() } else { "no".into() }, PositionPreference::None)));
         }
 
         if let Some(extends_id) = &self.extends_id {
@@ -269,6 +270,9 @@ impl SyntaxItemSerializable for Symbol {
         }
         if let Some(unit_name) = &self.unit_name {
             children.push(SyntaxItem::from_single_argument("unit_name", SyntaxArgument::QuotedString(unit_name.clone(), PositionPreference::None)));
+        }
+        if let Some(exclude_from_sim) = self.exclude_from_sim {
+            children.push(SyntaxItem::from_single_argument("exclude_from_sim", SyntaxArgument::Identifier(if exclude_from_sim { "yes".into() } else { "no".into() }, PositionPreference::None)));
         }
 
         children.extend(self.properties.iter().map(|property| property.serialize()).collect::<Vec<_>>());
@@ -296,8 +300,9 @@ impl SyntaxItemSerializable for Symbol {
 
         let mut symbol = Self {
             symbol_id: name,
-            in_bom: false,
-            on_board: false,
+            in_bom: None,
+            on_board: None,
+            exclude_from_sim: None,
             properties: Vec::new(),
             pins: Vec::new(),
             arcs: Vec::new(),
@@ -324,8 +329,9 @@ impl SyntaxItemSerializable for Symbol {
                 "polyline" => symbol.lines.push(SymbolLine::deserialize(&child)),
                 "rectangle" => symbol.rectangles.push(SymbolRectangle::deserialize(&child)),
                 "text" => symbol.texts.push(SymbolText::deserialize(&child)),
-                "in_bom" => symbol.in_bom = child.arguments.first().unwrap().get_string() == "yes",
-                "on_board" => symbol.on_board = child.arguments.first().unwrap().get_string() == "yes",
+                "in_bom" => symbol.in_bom = Some(child.arguments.first().unwrap().get_string() == "yes"),
+                "on_board" => symbol.on_board = Some(child.arguments.first().unwrap().get_string() == "yes"),
+                "exclude_from_sim" => symbol.exclude_from_sim = Some(child.arguments.first().unwrap().get_string() == "yes"),
                 "extends" => symbol.extends_id = Some(child.arguments.first().unwrap().get_string()),
                 "unit_name" => symbol.unit_name = Some(child.arguments.first().unwrap().get_string()),
                 "pin_numbers" => symbol.pin_numbers_hidden = child.arguments.first().unwrap().get_string() == "hidden",
@@ -656,7 +662,7 @@ impl SyntaxItemSerializable for SymbolText {
     fn deserialize(syntax: &SyntaxItem) -> Self {
         Self {
             text: syntax.arguments.first().unwrap().get_string(),
-            position: Position::deserialize(syntax.get_named_child("at").unwrap()),
+            position: TextPosition::deserialize(syntax.get_named_child("at").unwrap()),
             effects: TextEffect::deserialize(syntax.get_named_child("effects").unwrap()),
         }
     }

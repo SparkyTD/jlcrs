@@ -1304,7 +1304,7 @@ impl SyntaxItemSerializable for FootprintText {
                 FootprintTextType::Value => "value".into(),
                 FootprintTextType::User => "user".into(),
             }, PositionPreference::None),
-            SyntaxArgument::Identifier(self.text.clone(), PositionPreference::None),
+            SyntaxArgument::QuotedString(self.text.clone(), PositionPreference::None),
         ];
         if self.hide {
             arguments.push(SyntaxArgument::Identifier("hide".into(), PositionPreference::None));

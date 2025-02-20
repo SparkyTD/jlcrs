@@ -16,6 +16,13 @@ pub struct Position {
 }
 
 #[derive(Debug, Default, Clone)]
+pub struct TextPosition {
+    pub x: f32,
+    pub y: f32,
+    pub angle: Option<f32>,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct Id {
     pub id: u32,
 }
@@ -121,6 +128,28 @@ impl SyntaxItemSerializable for Position {
     }
 }
 
+impl SyntaxItemSerializable for TextPosition {
+    fn serialize(&self) -> SyntaxItem {
+        SyntaxItem {
+            name: "at".into(),
+            children: Vec::new(),
+            arguments: vec![
+                Some(SyntaxArgument::Number(self.x, PositionPreference::None)),
+                Some(SyntaxArgument::Number(self.y, PositionPreference::None)),
+                self.angle.and_then(|a| Some(SyntaxArgument::Number(a * 10.0, PositionPreference::None))),
+            ].iter().filter(|&o| o.is_some()).map(|o| o.as_ref().unwrap().clone()).collect(),
+        }
+    }
+
+    fn deserialize(syntax: &SyntaxItem) -> Self {
+        let x = syntax.arguments.get(0).unwrap().get_number();
+        let y = syntax.arguments.get(1).unwrap().get_number();
+        let rotation = syntax.arguments.get(2).and_then(|r| Some(r.get_number() / 10.0));
+
+        Self { x, y, angle: rotation }
+    }
+}
+
 impl SyntaxItemSerializable for Id {
     fn serialize(&self) -> SyntaxItem {
         SyntaxItem {
@@ -155,7 +184,7 @@ impl SyntaxItemSerializable for TextEffect {
     }
 
     fn deserialize(syntax: &SyntaxItem) -> Self {
-        let hide = if let Some(arg) = syntax.arguments.first() {
+        let mut hide = if let Some(arg) = syntax.arguments.first() {
             arg.get_string() == "hide"
         } else {
             false
@@ -168,7 +197,8 @@ impl SyntaxItemSerializable for TextEffect {
             match child.name.as_ref() {
                 "font" => font = Font::deserialize(&child),
                 "justify" => justify = TextJustify::deserialize(&child),
-                _ => panic!("Invalid child element for TextEffect"),
+                "hide" => hide = child.arguments.first().unwrap().get_string() == "yes",
+                str => panic!("Invalid child element for TextEffect: {}", str),
             }
         }
 
@@ -257,6 +287,7 @@ impl SyntaxItemSerializable for Font {
                 "line_spacing" => font.line_spacing = Some(child.arguments.first().unwrap().get_number()),
                 "size" => font.size = FontSize::deserialize(&child),
                 "bold" => font.bold = child.arguments.first().unwrap().get_string() == "yes",
+                "italic" => font.italic = child.arguments.first().unwrap().get_string() == "yes",
                 _ => panic!("Invalid child element '{}' for Font", child.name),
             }
         }
