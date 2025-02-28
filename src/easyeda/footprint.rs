@@ -1,12 +1,15 @@
-use std::collections::HashMap;
-use itertools::Itertools;
+use crate::easyeda::geometry::Point2D;
+use crate::easyeda::json_reader::JsonArrayReader;
+use crate::easyeda::errors::{FootprintConverterError, ParserError, ParserType};
+use crate::kicad::model::common::{Font, FontSize, Position, StrokeDefinition, TextEffect, TextJustifyHorizontal, TextJustifyVertical};
+use crate::kicad::model::footprint_library::{DrillDefinition, FootprintArc, FootprintAttributes, FootprintCircle, FootprintLibrary, FootprintLine, FootprintPad, FootprintPadPrimitives, FootprintPolygon, FootprintRectangle, FootprintText, FootprintTextType, FootprintType, PadShape, PadType, PcbLayer, PrimitivesContainer, Scalar2D, Scalar3D};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::easyeda::json_reader::JsonArrayReader;
-use crate::easyeda::{ParserError, ParserType};
-use crate::kicad::model::common::{Font, FontSize, Position, TextEffect, TextJustifyHorizontal, TextJustifyVertical};
-use crate::kicad::model::footprint_library::{DrillDefinition, FootprintArc, FootprintAttributes, FootprintCircle, FootprintLibrary, FootprintLine, FootprintPad, FootprintPolygon, FootprintText, FootprintTextType, FootprintType, PadShape, PadType, PcbLayer, Scalar2D, Scalar3D};
+use std::collections::HashMap;
+use std::f32::consts::PI;
+use std::ops::Add;
 
+#[allow(unused)]
 #[derive(Debug)]
 pub struct EasyEDAFootprint {
     pub head: Option<Head>,
@@ -25,9 +28,12 @@ pub struct EasyEDAFootprint {
     pub rules: Vec<Rule>,
     pub primitives: Vec<Primitive>,
     pub strings: HashMap<String, StringObject>,
+    pub vias: HashMap<String, Via>,
+    pub images: HashMap<String, Image>,
 }
 
 impl EasyEDAFootprint {
+    #[allow(unused)]
     pub fn load_and_parse(path: &str) -> anyhow::Result<EasyEDAFootprint> {
         let data = std::fs::read_to_string(path)?;
         Self::parse(&data)
@@ -42,11 +48,13 @@ impl EasyEDAFootprint {
         let mut layers = HashMap::new();
         let mut fills = HashMap::new();
         let mut pads = HashMap::new();
+        let mut vias = HashMap::new();
         let mut polygons = HashMap::new();
         let mut attributes = Vec::new();
         let mut nets = Vec::new();
         let mut primitives = Vec::new();
         let mut strings = HashMap::new();
+        let mut images = HashMap::new();
 
         let mut active_layer = 0;
 
@@ -83,10 +91,15 @@ impl EasyEDAFootprint {
                     fills.insert(fill.id.clone(), fill);
                 }
                 FootprintProperty::POLY(poly) => {
-                    polygons.insert(poly.id.clone(), poly);
+                    if !poly.path.is_null() {
+                        polygons.insert(poly.id.clone(), poly);
+                    }
                 }
                 FootprintProperty::PAD(pad) => {
                     pads.insert(pad.id.clone(), pad);
+                }
+                FootprintProperty::VIA(via) => {
+                    vias.insert(via.id.clone(), via);
                 }
                 FootprintProperty::NET(net) => {
                     nets.push(net);
@@ -118,6 +131,9 @@ impl EasyEDAFootprint {
                 FootprintProperty::PRIMITIVE(primitive) => {
                     primitives.push(primitive);
                 }
+                FootprintProperty::IMAGE(image) => {
+                    images.insert(image.id.clone(), image);
+                }
             }
         }
 
@@ -131,18 +147,22 @@ impl EasyEDAFootprint {
             fills,
             polygons,
             pads,
+            vias,
             nets,
             rule_template,
             rules,
             strings,
+            images,
             attributes,
             primitives,
         })
     }
 }
 
-impl Into<FootprintLibrary> for EasyEDAFootprint {
-    fn into(self) -> FootprintLibrary {
+impl TryInto<FootprintLibrary> for EasyEDAFootprint {
+    type Error = FootprintConverterError;
+
+    fn try_into(self) -> Result<FootprintLibrary, Self::Error> {
         let mut footprint = FootprintLibrary {
             node_identifier: "footprint".to_string(),
 
@@ -187,16 +207,62 @@ impl Into<FootprintLibrary> for EasyEDAFootprint {
         let mut max_y = f32::MIN;
         let mut min_y = f32::MAX;
 
-        fn get_kicad_layer(layer: &Layer) -> Option<PcbLayer> {
+        fn get_kicad_layer(layer: &Layer) -> Result<Option<PcbLayer>, FootprintConverterError> {
             match layer.layer_type.as_str() {
-                "TOP_SILK" => Some(PcbLayer::FSilkS),
-                "COMPONENT_SHAPE" | "DOCUMENT" => Some(PcbLayer::FFab),
-                "COMPONENT_MARKING" => Some(PcbLayer::FSilkS),
-                "TOP_PASTE_MASK" => Some(PcbLayer::FPaste),
-                "PIN_SOLDERING" | "PIN_FLOATING" => Some(PcbLayer::FFab),
-                "TOP" => Some(PcbLayer::FCu),
-                "MULTI" => None,
-                str => panic!("Footprint elements are not supported on layer: {}", str),
+                "TOP_SILK" => Ok(Some(PcbLayer::FSilkS)),
+                "BOT_SILK" => Ok(Some(PcbLayer::BSilkS)),
+                "COMPONENT_SHAPE" |
+                "DOCUMENT" |
+                "OUTLINE" |
+                "MECHANICAL" |
+                "BOT_ASSEMBLY" |
+                "TOP_ASSEMBLY" => Ok(Some(PcbLayer::FFab)),
+                "COMPONENT_MARKING" => Ok(Some(PcbLayer::FSilkS)),
+                "TOP_PASTE_MASK" => Ok(Some(PcbLayer::FPaste)),
+                "BOT_PASTE_MASK" => Ok(Some(PcbLayer::BPaste)),
+                "TOP_SOLDER_MASK" => Ok(Some(PcbLayer::FMask)),
+                "BOT_SOLDER_MASK" => Ok(Some(PcbLayer::BMask)),
+                "PIN_SOLDERING" |
+                "PIN_FLOATING" => Ok(Some(PcbLayer::FFab)),
+                "TOP" => Ok(Some(PcbLayer::FCu)),
+                "BOTTOM" => Ok(Some(PcbLayer::BCu)),
+                "MULTI" => Ok(None),
+                "SIGNAL" => {
+                    match layer.name.as_str() {
+                        "Inner1" => Ok(Some(PcbLayer::In1Cu)),
+                        "Inner2" => Ok(Some(PcbLayer::In2Cu)),
+                        "Inner3" => Ok(Some(PcbLayer::In3Cu)),
+                        "Inner4" => Ok(Some(PcbLayer::In4Cu)),
+                        "Inner5" => Ok(Some(PcbLayer::In5Cu)),
+                        "Inner6" => Ok(Some(PcbLayer::In6Cu)),
+                        "Inner7" => Ok(Some(PcbLayer::In7Cu)),
+                        "Inner8" => Ok(Some(PcbLayer::In8Cu)),
+                        "Inner9" => Ok(Some(PcbLayer::In9Cu)),
+                        "Inner10" => Ok(Some(PcbLayer::In10Cu)),
+                        "Inner11" => Ok(Some(PcbLayer::In11Cu)),
+                        "Inner12" => Ok(Some(PcbLayer::In12Cu)),
+                        "Inner13" => Ok(Some(PcbLayer::In13Cu)),
+                        "Inner14" => Ok(Some(PcbLayer::In14Cu)),
+                        "Inner15" => Ok(Some(PcbLayer::In15Cu)),
+                        "Inner16" => Ok(Some(PcbLayer::In16Cu)),
+                        "Inner17" => Ok(Some(PcbLayer::In17Cu)),
+                        "Inner18" => Ok(Some(PcbLayer::In18Cu)),
+                        "Inner19" => Ok(Some(PcbLayer::In19Cu)),
+                        "Inner20" => Ok(Some(PcbLayer::In20Cu)),
+                        "Inner21" => Ok(Some(PcbLayer::In21Cu)),
+                        "Inner22" => Ok(Some(PcbLayer::In22Cu)),
+                        "Inner23" => Ok(Some(PcbLayer::In23Cu)),
+                        "Inner24" => Ok(Some(PcbLayer::In24Cu)),
+                        "Inner25" => Ok(Some(PcbLayer::In25Cu)),
+                        "Inner26" => Ok(Some(PcbLayer::In26Cu)),
+                        "Inner27" => Ok(Some(PcbLayer::In27Cu)),
+                        "Inner28" => Ok(Some(PcbLayer::In28Cu)),
+                        "Inner29" => Ok(Some(PcbLayer::In29Cu)),
+                        "Inner30" => Ok(Some(PcbLayer::In30Cu)),
+                        str => Err(FootprintConverterError::UnsupportedInnerLayer(str.to_string()))
+                    }
+                }
+                str => Err(FootprintConverterError::UnsupportedLayer(format!("{:?}", str))),
             }
         }
 
@@ -204,281 +270,26 @@ impl Into<FootprintLibrary> for EasyEDAFootprint {
         for (_id, polygon) in &self.polygons {
             let layer = self.layers.get(&polygon.layer_id).unwrap();
             let path = polygon.path.as_array().unwrap();
-            let kicad_layer = get_kicad_layer(layer);
+            let kicad_layer = get_kicad_layer(layer)?;
             if kicad_layer.is_none() {
                 continue;
             }
+
             let kicad_layer = kicad_layer.unwrap();
-
-            if path.len() == 5 && path.get(2).unwrap().as_str().is_some_and(|s| s == "L") { // Simple line
-                let start_x = path.get(0).unwrap().as_f64().unwrap() as f32 * scale_factor;
-                let start_y = -path.get(1).unwrap().as_f64().unwrap() as f32 * scale_factor;
-                let end_x = path.get(3).unwrap().as_f64().unwrap() as f32 * scale_factor;
-                let end_y = -path.get(4).unwrap().as_f64().unwrap() as f32 * scale_factor;
-
-                max_y = max_y.max(start_y.max(end_y));
-                min_y = min_y.min(start_y.min(end_y));
-
-                footprint.lines.push(FootprintLine {
-                    start: Scalar2D::new("start", start_x, start_y),
-                    end: Scalar2D::new("end", end_x, end_y),
-                    layer: kicad_layer,
-                    width: Some(polygon.width * scale_factor),
-                    uuid: None,
-                    locked: false,
-                    stroke: None,
-                });
-            } else if path.len() >= 3 && path.get(2).unwrap().as_str().is_some_and(|s| s == "L") { // Hollow polygon
-                let points = path
-                    .iter()
-                    .filter(|v| v.is_f64() || v.is_i64())
-                    .collect_vec()
-                    .chunks(2)
-                    .into_iter()
-                    .map(|c| Scalar2D::new("xy",
-                                           c.get(0).unwrap().as_f64().unwrap() as f32 * scale_factor,
-                                           -c.get(1).unwrap().as_f64().unwrap() as f32 * scale_factor))
-                    .collect_vec();
-
-                points.iter().for_each(|p| {
-                    max_y = max_y.max(p.y);
-                    min_y = min_y.min(p.y);
-                });
-
-                footprint.polygons.push(FootprintPolygon {
-                    fill: Some(false),
-                    layer: kicad_layer,
-                    width: Some(polygon.width * scale_factor),
-                    points,
-                    stroke: None,
-                    uuid: None,
-                    locked: false,
-                })
-            } else if path.len() == 4 && path.get(0).unwrap().as_str().is_some_and(|s| s == "CIRCLE") {
-                let center_x = path.get(1).unwrap().as_f64().unwrap() as f32 * scale_factor;
-                let center_y = -path.get(2).unwrap().as_f64().unwrap() as f32 * scale_factor;
-                let radius = path.get(3).unwrap().as_f64().unwrap() as f32 * scale_factor;
-
-                max_y = max_y.max(center_y + radius);
-                min_y = min_y.min(center_y - radius);
-
-                footprint.circles.push(FootprintCircle {
-                    center: Scalar2D::new("center", center_x, center_y),
-                    end: Scalar2D::new("end", center_x + radius, center_y),
-                    layer: kicad_layer,
-                    width: Some(polygon.width * scale_factor),
-                    stroke: None,
-                    fill: Some(false),
-                    uuid: None,
-                    locked: false,
-                });
-            } else if path.len() == 6 && path.get(2).unwrap().as_str().is_some_and(|s| s == "ARC") {
-                let mut start_x = path.get(0).unwrap().as_f64().unwrap() as f32 * scale_factor;
-                let mut start_y = -path.get(1).unwrap().as_f64().unwrap() as f32 * scale_factor;
-                let mut end_x = path.get(4).unwrap().as_f64().unwrap() as f32 * scale_factor;
-                let mut end_y = -path.get(5).unwrap().as_f64().unwrap() as f32 * scale_factor;
-                let rotation = -path.get(3).unwrap().as_f64().unwrap() as f32;
-
-                // Calculate the chord's midpoint
-                let chord_mid_x = (start_x + end_x) / 2.0;
-                let chord_mid_y = (start_y + end_y) / 2.0;
-
-                // Calculate the chord length
-                let chord_dx = end_x - start_x;
-                let chord_dy = end_y - start_y;
-                let chord_length = (chord_dx * chord_dx + chord_dy * chord_dy).sqrt();
-
-                // Convert rotation to radians and get its properties
-                let rotation_rad = rotation.to_radians();
-                let is_major_arc = rotation.abs() > 180.0;
-                let direction = if rotation >= 0.0 { 1.0 } else { -1.0 };
-
-                // Calculate radius using the chord length and rotation angle
-                // Using the formula: R = (chord_length/2) / sin(rotation/2)
-                let half_rotation_rad = rotation_rad / 2.0;
-                let radius = (chord_length / 2.0) / half_rotation_rad.sin().abs(); // Use abs to handle negative angles
-
-                // Calculate the perpendicular vector to the chord
-                let perp_dx = -chord_dy / chord_length;
-                let perp_dy = chord_dx / chord_length;
-
-                // Calculate the distance from chord midpoint to circle center
-                // Using the formula: distance = R * cos(rotation/2)
-                let center_distance = radius * half_rotation_rad.cos().abs(); // Use abs to handle negative angles
-
-                // Calculate the circle center
-                let center_x = chord_mid_x + direction * perp_dx * center_distance;
-                let center_y = chord_mid_y + direction * perp_dy * center_distance;
-
-                // Calculate the start angle
-                let start_angle = (start_y - center_y).atan2(start_x - center_x);
-
-                // For the middle point, we need to consider:
-                // - For minor arcs (< 180°): We want half the actual rotation
-                // - For major arcs (> 180°): We want half the complementary rotation (360° - rotation)
-                let mid_angle_offset = if is_major_arc {
-                    // For major arcs, we go the long way around
-                    let complement = 360.0 - rotation.abs();
-                    (complement / 2.0).to_radians() * direction * -1.0 // Reverse direction for major arcs
-                } else {
-                    // For minor arcs, we go the short way around
-                    half_rotation_rad
-                };
-
-                // Calculate the middle point
-                let mid_x = center_x + radius * (start_angle + mid_angle_offset).cos();
-                let mid_y = center_y + radius * (start_angle + mid_angle_offset).sin();
-
-                footprint.arcs.push(FootprintArc {
-                    start: Scalar2D::new("start", start_x, start_y),
-                    mid: Some(Scalar2D::new("mid", mid_x, mid_y)),
-                    end: Scalar2D::new("end", end_x, end_y),
-                    layer: kicad_layer,
-                    width: Some(polygon.width * scale_factor),
-                    angle: None,
-                    stroke: None,
-                    uuid: None,
-                    locked: false,
-                })
-            } else if path.len() == 6 && path.get(2).unwrap().as_str().is_some_and(|s| s == "CARC") {
-                let mut start_x = path.get(0).unwrap().as_f64().unwrap() as f32 * scale_factor;
-                let mut start_y = -path.get(1).unwrap().as_f64().unwrap() as f32 * scale_factor;
-                let mut end_x = path.get(4).unwrap().as_f64().unwrap() as f32 * scale_factor;
-                let mut end_y = -path.get(5).unwrap().as_f64().unwrap() as f32 * scale_factor;
-                let rotation = path.get(3).unwrap().as_f64().unwrap() as f32;
-
-                // Calculate the chord's midpoint
-                let chord_mid_x = (start_x + end_x) / 2.0;
-                let chord_mid_y = (start_y + end_y) / 2.0;
-
-                // Calculate the chord length
-                let chord_dx = end_x - start_x;
-                let chord_dy = end_y - start_y;
-                let chord_length = (chord_dx * chord_dx + chord_dy * chord_dy).sqrt();
-
-                // Convert rotation to radians and get its properties
-                let rotation_rad = rotation.to_radians();
-                let is_major_arc = rotation.abs() > 180.0;
-                let direction = if rotation >= 0.0 { 1.0 } else { -1.0 };
-
-                // Calculate radius using the chord length and rotation angle
-                // Using the formula: R = (chord_length/2) / sin(rotation/2)
-                let half_rotation_rad = rotation_rad / 2.0;
-                let radius = (chord_length / 2.0) / half_rotation_rad.sin().abs(); // Use abs to handle negative angles
-
-                // Calculate the perpendicular vector to the chord
-                let perp_dx = -chord_dy / chord_length;
-                let perp_dy = chord_dx / chord_length;
-
-                // Calculate the distance from chord midpoint to circle center
-                // Using the formula: distance = R * cos(rotation/2)
-                let center_distance = radius * half_rotation_rad.cos().abs(); // Use abs to handle negative angles
-
-                // Calculate the circle center
-                let center_x = chord_mid_x + direction * perp_dx * center_distance;
-                let center_y = chord_mid_y + direction * perp_dy * center_distance;
-
-                // Calculate the start angle
-                let start_angle = (start_y - center_y).atan2(start_x - center_x);
-
-                // For the middle point, we need to consider:
-                // - For minor arcs (< 180°): We want half the actual rotation
-                // - For major arcs (> 180°): We want half the complementary rotation (360° - rotation)
-                let mid_angle_offset = if is_major_arc {
-                    // For major arcs, we go the long way around
-                    let complement = 360.0 - rotation.abs();
-                    (complement / 2.0).to_radians() * direction * -1.0 // Reverse direction for major arcs
-                } else {
-                    // For minor arcs, we go the short way around
-                    half_rotation_rad
-                };
-
-                // Calculate the middle point
-                let mid_x = center_x + radius * (start_angle + mid_angle_offset).cos();
-                let mid_y = center_y + radius * (start_angle + mid_angle_offset).sin();
-
-                footprint.arcs.push(FootprintArc {
-                    start: Scalar2D::new("start", start_x, start_y),
-                    mid: Some(Scalar2D::new("mid", mid_x, mid_y)),
-                    end: Scalar2D::new("end", end_x, end_y),
-                    layer: kicad_layer,
-                    width: Some(polygon.width * scale_factor),
-                    angle: None,
-                    stroke: None,
-                    uuid: None,
-                    locked: false,
-                })
-            } else {
-                panic!("This type of polygon element is not currently implemented: {:?}", polygon);
-            }
+            Self::populate_footprint_shapes(path, &mut footprint, kicad_layer, polygon.width, false, None, scale_factor, None);
         }
 
         // Non-mechanical fills
         for (_id, fill) in &self.fills {
             let layer = self.layers.get(&fill.layer_id).unwrap();
-            let mut path_list = fill.path.as_array().unwrap().clone();
-            let kicad_layer = get_kicad_layer(layer);
+            let path_list = fill.path.as_array().unwrap().clone();
+            let kicad_layer = get_kicad_layer(layer)?;
             if kicad_layer.is_none() {
                 continue;
             }
+
             let kicad_layer = kicad_layer.unwrap();
-
-            if !path_list.first().unwrap().is_array() {
-                path_list = vec![fill.path.clone()];
-            }
-
-            for sub_path in path_list {
-                let path = sub_path.as_array().unwrap();
-                if path.len() == 4 && path.get(0).unwrap().as_str().is_some_and(|s| s == "CIRCLE") {
-                    let center_x = path.get(1).unwrap().as_f64().unwrap() as f32 * scale_factor;
-                    let center_y = -path.get(2).unwrap().as_f64().unwrap() as f32 * scale_factor;
-                    let radius = path.get(3).unwrap().as_f64().unwrap() as f32 * scale_factor;
-
-                    max_y = max_y.max(center_y + radius);
-                    min_y = min_y.min(center_y + radius);
-
-                    footprint.circles.push(FootprintCircle {
-                        center: Scalar2D::new("center", center_x, center_y),
-                        end: Scalar2D::new("end", center_x + radius, center_y),
-                        layer: kicad_layer,
-                        width: Some(fill.width * scale_factor),
-                        fill: Some(true),
-                        stroke: None,
-                        uuid: None,
-                        locked: false,
-                    })
-                } else if path.len() > 3 && path.get(2).unwrap().as_str().is_some_and(|s| s == "L") {
-                    let points = path
-                        .iter()
-                        .filter(|v| v.is_f64() || v.is_i64())
-                        .collect_vec()
-                        .chunks(2)
-                        .into_iter()
-                        .map(|c| Scalar2D::new("xy",
-                                               c.get(0).unwrap().as_f64().unwrap() as f32 * scale_factor,
-                                               -c.get(1).unwrap().as_f64().unwrap() as f32 * scale_factor))
-                        .collect_vec();
-
-                    points.iter().for_each(|p| {
-                        max_y = max_y.max(p.y);
-                        min_y = min_y.min(p.y);
-                    });
-
-                    footprint.polygons.push(FootprintPolygon {
-                        fill: Some(true),
-                        layer: kicad_layer,
-                        width: Some(fill.width * scale_factor),
-                        points,
-                        stroke: None,
-                        uuid: None,
-                        locked: false,
-                    })
-                } else {
-                    panic!("This type of fill element is not currently implemented: {:?}", fill);
-
-                    // todo handle [0, 55, "ARC", -90,-20, 75, "L", -20, 125, 20, 125, 20, 75, "ARC", -90, 0, 55]
-                }
-            }
+            Self::populate_footprint_shapes(&path_list, &mut footprint, kicad_layer, fill.width, true, None, scale_factor, None);
         }
 
         // Mechanical NPTH fills
@@ -541,7 +352,8 @@ impl Into<FootprintLibrary> for EasyEDAFootprint {
                     footprint.attributes.as_mut().unwrap().footprint_type = FootprintType::ThroughHole;
                     footprint.pads.push(ki_pad);
                 } else {
-                    panic!("This type of fill element is not currently implemented: {:?}", fill);
+                    let kicad_layer = PcbLayer::EdgeCuts;
+                    Self::populate_footprint_shapes(path, &mut footprint, kicad_layer, 0.05, false, None, scale_factor, None);
                 }
             }
         }
@@ -550,7 +362,7 @@ impl Into<FootprintLibrary> for EasyEDAFootprint {
         for (_id, pad) in &self.pads {
             let layer = self.layers.get(&pad.layer_id).unwrap();
             let path = pad.path.as_ref().unwrap().as_array().unwrap();
-            let kicad_layer = get_kicad_layer(layer);
+            let kicad_layer = get_kicad_layer(layer)?;
 
             max_y = max_y.max(pad.center_y * scale_factor);
             min_y = min_y.min(pad.center_y * scale_factor);
@@ -559,7 +371,11 @@ impl Into<FootprintLibrary> for EasyEDAFootprint {
                 number: pad.num.clone(),
                 pad_type: PadType::Smd,
                 pad_shape: PadShape::Custom,
-                position: Position { x: pad.center_x * scale_factor, y: -pad.center_y * scale_factor, angle: Some(pad.rotation) },
+                position: Position {
+                    x: pad.center_x * scale_factor,
+                    y: -pad.center_y * scale_factor,
+                    angle: Some(pad.rotation),
+                },
                 size: Scalar2D::new("size", 0.0, 0.0), // todo
                 locked: false,
                 drill: None,
@@ -583,7 +399,7 @@ impl Into<FootprintLibrary> for EasyEDAFootprint {
                 pin_type: None,
                 die_length: None,
                 solder_mask_margin: pad.top_solder_expansion.or(Some(2.0)).map(|v| v * scale_factor),
-                solder_paste_margin: pad.top_paste_expansion.or(Some(0.0)).map(|v| v * scale_factor),
+                solder_paste_margin: pad.top_paste_expansion.or(Some(0.0)).map(|v| v * scale_factor).map(|v| v.max(0.0)),
                 solder_paste_margin_ratio: None,
                 zone_connection: None,
                 clearance: None,
@@ -606,8 +422,32 @@ impl Into<FootprintLibrary> for EasyEDAFootprint {
                 /*if pad.rotation.abs() == 90.0 || pad.rotation.abs() == 270.0 {
                     (ki_pad.size.x, ki_pad.size.y) = (ki_pad.size.y, ki_pad.size.x);
                 }*/
+            } else if path.get(0).unwrap().as_str().is_some_and(|s| s == "POLY") {
+                let path_data = path.get(1).unwrap().as_array().unwrap().clone();
+                // let path_data = Self::parse_path_expression(path_data, scale_factor);
+
+                ki_pad.pad_shape = PadShape::Custom;
+                ki_pad.size.x = 0.01;
+                ki_pad.size.y = 0.01;
+
+                let mut pad_primitives = FootprintPadPrimitives {
+                    width: Some(0.2),
+                    fill: Some(true),
+                    rectangles: Vec::new(),
+                    circles: Vec::new(),
+                    polygons: Vec::new(),
+                    lines: Vec::new(),
+                    arcs: Vec::new(),
+                    curves: Vec::new(),
+                    annotation_boxes: Vec::new(),
+                };
+
+                Self::populate_footprint_shapes(&path_data, &mut pad_primitives, PcbLayer::FCu, 0.1, true, None, scale_factor, Some(Point2D::new(-pad.center_x * scale_factor, pad.center_y * scale_factor)));
+                pad_primitives.width = None;
+                pad_primitives.fill = None;
+                ki_pad.primitives = Some(pad_primitives);
             } else {
-                panic!("This type of pad shape is not currently implemented: {:?}", pad);
+                return Err(FootprintConverterError::UnsupportedPadShape(format!("{:?}", pad)));
             }
 
             if pad.hole.as_ref().unwrap().is_null() {
@@ -620,14 +460,74 @@ impl Into<FootprintLibrary> for EasyEDAFootprint {
                 let hole_shape = hole_shape.get(0).unwrap().as_str().unwrap();
                 assert!(hole_shape == "SLOT" || hole_shape == "ROUND", "The following THT hole shape is not supported: '{}'", hole_shape);
 
+                if let Some(hole_rotation) = pad.hole_rotation {
+                    let hole_rotation = hole_rotation.abs() as u32 % 360;
+                    match hole_rotation {
+                        0 | 180 => {}
+                        90 | 270 => {
+                            (hole_param1, hole_param2) = (hole_param2, hole_param1)
+                        }
+                        rot => {
+                            return Err(FootprintConverterError::UnsupportedDrillRotation(rot))
+                        }
+                    }
+                }
+
                 ki_pad.pad_type = PadType::ThruHole;
                 ki_pad.drill = Some(DrillDefinition {
                     oval: hole_shape == "SLOT",
                     offset: Some(Scalar2D::new("offset", pad.hole_offset_x * scale_factor, pad.hole_offset_y * scale_factor)),
-                    width: Some(hole_param1 * scale_factor),
-                    diameter: hole_param2 * scale_factor,
+                    width: Some(hole_param2 * scale_factor),
+                    diameter: hole_param1 * scale_factor,
                 });
             }
+
+            footprint.pads.push(ki_pad);
+        }
+
+        // Vias
+        for (_id, via) in &self.vias {
+            let ki_pad = FootprintPad {
+                number: via.name.clone(),
+                pad_type: PadType::ThruHole,
+                pad_shape: PadShape::Circle,
+                position: Position {
+                    x: via.center_x * scale_factor,
+                    y: -via.center_y * scale_factor,
+                    angle: None,
+                },
+                size: Scalar2D::new("size", via.via_diameter * scale_factor, via.via_diameter * scale_factor), // todo
+                locked: false,
+                drill: Some(DrillDefinition {
+                    oval: false,
+                    diameter: via.hole_diameter * scale_factor,
+                    width: None,
+                    offset: None,
+                }),
+                layers: {
+                    let mut vec = vec![PcbLayer::FMask, PcbLayer::BMask];
+                    vec.extend(PcbLayer::all_copper());
+                    vec
+                },
+                property: None,
+                remove_unused_layer: None,
+                keep_end_layers: None,
+                round_rect_ratio: None,
+                chamfer_ratio: None,
+                chamfer: vec![],
+                net: None,
+                uuid: None,
+                pin_function: None,
+                pin_type: None,
+                die_length: None,
+                solder_mask_margin: via.top_solder_expansion.or(Some(2.0)).map(|v| v * scale_factor),
+                solder_paste_margin: None,
+                solder_paste_margin_ratio: None,
+                zone_connection: None,
+                clearance: None,
+                options: None,
+                primitives: None,
+            };
 
             footprint.pads.push(ki_pad);
         }
@@ -635,7 +535,7 @@ impl Into<FootprintLibrary> for EasyEDAFootprint {
         // Strings
         for (_id, string) in &self.strings {
             let layer = self.layers.get(&string.layer_id).unwrap();
-            let kicad_layer = get_kicad_layer(layer);
+            let kicad_layer = get_kicad_layer(layer)?;
             if kicad_layer.is_none() {
                 continue;
             }
@@ -654,12 +554,11 @@ impl Into<FootprintLibrary> for EasyEDAFootprint {
                 7 => (Some(TextJustifyHorizontal::Right), Some(TextJustifyVertical::Bottom)),
                 8 | 9 | _ => (Some(TextJustifyHorizontal::Right), Some(TextJustifyVertical::Top)),
             };
-            println!("{}", string.origin);
 
             footprint.texts.push(FootprintText {
                 text_type: FootprintTextType::User,
                 text: string.text.clone(),
-                position: Position { x: string.pos_x * scale_factor, y: string.pos_y * scale_factor, angle: Some(string.angle) },
+                position: Position { x: string.pos_x * scale_factor, y: -string.pos_y * scale_factor, angle: Some(string.angle) },
                 unlocked: Some(true),
                 layer: kicad_layer,
                 hide: false,
@@ -695,7 +594,513 @@ impl Into<FootprintLibrary> for EasyEDAFootprint {
             effects: default_text_effect.clone(),
         });
 
-        footprint
+        Ok(footprint)
+    }
+}
+
+#[derive(Debug)]
+pub enum PathCommand {
+    MoveTo { position: Point2D },
+    LineTo { position: Point2D },
+    ArcTo { end: Point2D, rotation: f32 },
+    CenterArcTo { end: Point2D, rotation: f32 },
+    Circle { center: Point2D, radius: f32 },
+    Rectangle { start: Point2D, width: f32, height: f32, rotation: f32, corner_radius: f32 },
+}
+
+impl Add for Point2D {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Point2D::new(self.x + rhs.x, self.y + rhs.y)
+    }
+}
+
+impl EasyEDAFootprint {
+    fn populate_footprint_shapes(
+        paths: &Vec<Value>,
+        footprint: &mut impl PrimitivesContainer,
+        layer: PcbLayer, stroke_width: f32,
+        filled: bool,
+        stroke: Option<StrokeDefinition>,
+        scale_factor: f32,
+        offset: Option<Point2D>,
+    ) -> bool {
+        if paths.len() == 0 {
+            return true;
+        }
+
+        // Handle nested arrays on the top level
+        if paths.iter().all(|path| path.is_array()) {
+            for sub_path in paths.iter().map(|path| path.as_array().unwrap()) {
+                Self::populate_footprint_shapes(sub_path, footprint, layer, stroke_width, filled, stroke.clone(), scale_factor, offset);
+            }
+            return true;
+        }
+
+        let path = Self::parse_path_expression(paths.clone(), scale_factor);
+        let is_standalone_shape = path.iter().all(|c| match c {
+            PathCommand::Circle { .. } | PathCommand::Rectangle { .. } => true,
+            _ => false,
+        });
+        let contains_arcs = !is_standalone_shape && path.iter().any(|c| match c {
+            PathCommand::ArcTo { .. } | PathCommand::CenterArcTo { .. } => true,
+            _ => false,
+        });
+        let path = if let Some(offset) = offset {
+            path.into_iter().map(|c| match c {
+                PathCommand::MoveTo { position } => PathCommand::MoveTo { position: position + offset },
+                PathCommand::LineTo { position } => PathCommand::MoveTo { position: position + offset },
+                PathCommand::ArcTo { end, rotation } => PathCommand::ArcTo { end: end + offset, rotation },
+                PathCommand::CenterArcTo { end, rotation } => PathCommand::CenterArcTo { end: end + offset, rotation },
+                PathCommand::Circle { center, radius } => PathCommand::Circle { center: center + offset, radius },
+                PathCommand::Rectangle { start, width, height, rotation, corner_radius } => PathCommand::Rectangle { start: start + offset, width, height, rotation, corner_radius }
+            }).collect()
+        } else {
+            path
+        };
+
+        let mut bb_min = Point2D::new(f32::MAX, f32::MAX);
+        let mut bb_max = Point2D::new(f32::MIN, f32::MIN);
+        if is_standalone_shape {
+            for command in path {
+                Self::expand_bbox_to_shape(&command, &mut bb_min, &mut bb_max);
+                match command {
+                    PathCommand::Circle { center, radius } => {
+                        footprint.add_circle(FootprintCircle {
+                            center: Scalar2D::new("center", center.x, center.y),
+                            end: Scalar2D::new("end", center.x + radius, center.y),
+                            layer,
+                            width: Some(stroke_width * scale_factor),
+                            fill: Some(filled),
+                            stroke: None,
+                            uuid: None,
+                            locked: false,
+                        })
+                    }
+                    PathCommand::Rectangle { start, width, height, rotation, corner_radius } => {
+                        if rotation == 0.0 && corner_radius == 0.0 {
+                            footprint.add_rectangle(FootprintRectangle {
+                                start: Scalar2D::new("center", start.x, start.y),
+                                end: Scalar2D::new("end", start.x + width, start.y + height),
+                                layer,
+                                width: Some(stroke_width * scale_factor),
+                                fill: Some(filled),
+                                stroke: None,
+                                uuid: None,
+                                locked: false,
+                            })
+                        } else {
+                            todo!("Angled rectangles or corner radii are not implemented yet")
+                        }
+                    }
+                    PathCommand::MoveTo { .. } |
+                    PathCommand::LineTo { .. } |
+                    PathCommand::ArcTo { .. } |
+                    PathCommand::CenterArcTo { .. } => unreachable!(),
+                }
+            }
+        } else if !contains_arcs {
+            match path.as_slice() {
+                // Handle simple lines
+                [PathCommand::MoveTo { position: start }, PathCommand::LineTo { position: end }] => {
+                    Self::expand_bbox_to_shape(&path[0], &mut bb_min, &mut bb_max);
+                    Self::expand_bbox_to_shape(&path[1], &mut bb_min, &mut bb_max);
+                    footprint.add_line(FootprintLine {
+                        start: Scalar2D::new("start", start.x, start.y),
+                        end: Scalar2D::new("end", end.x, end.y),
+                        layer,
+                        width: Some(stroke_width * scale_factor),
+                        uuid: None,
+                        locked: false,
+                        stroke: None,
+                    });
+                }
+
+                // Handle polygons
+                polygon => {
+                    let mut points = vec![];
+                    for command in polygon {
+                        Self::expand_bbox_to_shape(&command, &mut bb_min, &mut bb_max);
+                        match command {
+                            PathCommand::MoveTo { position } => {
+                                points.push(position.to_scalar_2d("xy"));
+                            }
+                            PathCommand::LineTo { position } => {
+                                points.push(position.to_scalar_2d("xy"));
+                            }
+                            PathCommand::ArcTo { .. } | PathCommand::CenterArcTo { .. } => unreachable!(),
+                            PathCommand::Circle { .. } | PathCommand::Rectangle { .. } => unreachable!(),
+                        }
+                    }
+
+                    footprint.add_polygon(FootprintPolygon {
+                        fill: Some(filled),
+                        layer,
+                        width: Some(stroke_width * scale_factor),
+                        points,
+                        stroke: None,
+                        uuid: None,
+                        locked: false,
+                    })
+                }
+            }
+        } else if contains_arcs {
+            // println!("{:?}", path);
+            match path.as_slice() {
+                // Handle standalone arc
+                [PathCommand::MoveTo { position: start }, PathCommand::ArcTo { end, rotation }] |
+                [PathCommand::MoveTo { position: start }, PathCommand::CenterArcTo { end, rotation }] => {
+                    let start = Point2D::new(start.x, start.y);
+                    let end = Point2D::new(end.x, -end.y);
+                    let mid = Self::get_arc_center(start, end, *rotation);
+                    footprint.add_arc(FootprintArc {
+                        start: Scalar2D::new("start", start.x, start.y),
+                        mid: Some(Scalar2D::new("mid", mid.x, mid.y)),
+                        end: Scalar2D::new("end", end.x, end.y),
+                        layer,
+                        width: Some(stroke_width * scale_factor),
+                        angle: None,
+                        stroke: None,
+                        uuid: None,
+                        locked: false,
+                    });
+                }
+
+                // Handle polygons
+                polygon => {
+                    let mut points = vec![];
+                    let mut last_position = Point2D::new(0.0, 0.0);
+                    for command in polygon {
+                        match command {
+                            PathCommand::MoveTo { position } => {
+                                points.push(position.to_scalar_2d("xy"));
+                                last_position = position.clone();
+                            }
+                            PathCommand::LineTo { position } => {
+                                points.push(position.to_scalar_2d("xy"));
+                                last_position = position.clone();
+                            }
+                            PathCommand::ArcTo { end, rotation } |
+                            PathCommand::CenterArcTo { end, rotation } => {
+                                let end = Point2D::new(end.x, -end.y);
+
+                                for mid in Self::interpolate_arc_points(last_position, end, -*rotation, 8.0) {
+                                    points.push(mid.to_scalar_2d("xy"));
+                                }
+
+                                points.push(end.to_scalar_2d("xy"));
+                                last_position = end.clone();
+                            }
+                            PathCommand::Circle { .. } | PathCommand::Rectangle { .. } => unreachable!(),
+                        }
+                    }
+
+                    footprint.add_polygon(FootprintPolygon {
+                        fill: Some(filled),
+                        layer,
+                        width: Some(stroke_width * scale_factor),
+                        points,
+                        stroke: None,
+                        uuid: None,
+                        locked: false,
+                    })
+                }
+            }
+        }
+
+        true
+    }
+
+    fn parse_path_expression(mut path: Vec<Value>, scale_factor: f32) -> Vec<PathCommand> {
+        // Ensure that the first element is a Move ("M") command
+        if path.first().unwrap().is_f64() || path.first().unwrap().is_i64() {
+            path.insert(0, Value::String("M".into()));
+        }
+
+        // Prefix all LineTo coordinates with the "L" command
+        let mut line_pair_counter = 0;
+        let mut is_line_segment = false;
+        let mut i = 3;
+        while i < path.len() {
+            let value = &path[i];
+            if value.is_string() {
+                is_line_segment = value.as_str().unwrap() == "L";
+                if is_line_segment {
+                    line_pair_counter = 0;
+                }
+            } else if is_line_segment {
+                if line_pair_counter > 0 && (line_pair_counter) % 2 == 0 {
+                    path.insert(i, Value::String("L".into()));
+                    line_pair_counter = 0;
+                } else {
+                    line_pair_counter += 1;
+                }
+            }
+            i += 1;
+        }
+
+        // Deserialize path commands
+        let mut param_iter = path.into_iter();
+        let mut path = vec![];
+        while let Some(command) = param_iter.next() {
+            assert!(command.is_string(), "Expected a command token, got '{:?}' instead", command);
+            let command = command.as_str().unwrap();
+            path.push(match command {
+                "M" => PathCommand::MoveTo {
+                    position: Point2D::new(
+                        param_iter.next().unwrap().as_f64().unwrap() as f32 * scale_factor,
+                        -param_iter.next().unwrap().as_f64().unwrap() as f32 * scale_factor,
+                    )
+                },
+                "L" => PathCommand::LineTo {
+                    position: Point2D::new(
+                        param_iter.next().unwrap().as_f64().unwrap() as f32 * scale_factor,
+                        -param_iter.next().unwrap().as_f64().unwrap() as f32 * scale_factor,
+                    )
+                },
+                "ARC" => PathCommand::ArcTo {
+                    rotation: param_iter.next().unwrap().as_f64().unwrap() as f32,
+                    end: Point2D::new(
+                        param_iter.next().unwrap().as_f64().unwrap() as f32 * scale_factor,
+                        param_iter.next().unwrap().as_f64().unwrap() as f32 * scale_factor,
+                    ),
+                },
+                "CARC" => PathCommand::CenterArcTo {
+                    rotation: param_iter.next().unwrap().as_f64().unwrap() as f32,
+                    end: Point2D::new(
+                        param_iter.next().unwrap().as_f64().unwrap() as f32 * scale_factor,
+                        param_iter.next().unwrap().as_f64().unwrap() as f32 * scale_factor,
+                    ),
+                },
+                "CIRCLE" => PathCommand::Circle {
+                    center: Point2D::new(
+                        param_iter.next().unwrap().as_f64().unwrap() as f32 * scale_factor,
+                        -param_iter.next().unwrap().as_f64().unwrap() as f32 * scale_factor,
+                    ),
+                    radius: param_iter.next().unwrap().as_f64().unwrap() as f32 * scale_factor,
+                },
+                "R" => PathCommand::Rectangle {
+                    start: Point2D::new(
+                        param_iter.next().unwrap().as_f64().unwrap() as f32 * scale_factor,
+                        -param_iter.next().unwrap().as_f64().unwrap() as f32 * scale_factor,
+                    ),
+                    width: param_iter.next().unwrap().as_f64().unwrap() as f32 * scale_factor,
+                    height: param_iter.next().unwrap().as_f64().unwrap() as f32 * scale_factor,
+                    rotation: param_iter.next().unwrap().as_f64().unwrap() as f32,
+                    corner_radius: param_iter.next().map(|v| v.as_f64().unwrap() as f32 * scale_factor).unwrap_or(0.0),
+                },
+                str => panic!("Unsupported command found: '{}'", str),
+            });
+        }
+
+        path
+    }
+
+    fn get_arc_center(start: Point2D, end: Point2D, angle: f32) -> Point2D {
+        // Calculate chord midpoint
+        let chord_mid = Point2D {
+            x: (start.x + end.x) / 2.0,
+            y: (start.y + end.y) / 2.0,
+        };
+
+        // Calculate chord length
+        let chord_length = f32::sqrt(
+            (end.x - start.x).powi(2) +
+                (end.y - start.y).powi(2)
+        );
+
+        // Convert arc angle to radians and get central angle
+        let arc_angle = angle.abs() * std::f32::consts::PI / 180.0;
+        let central_angle = arc_angle / 2.0;
+
+        // Calculate radius using r = c/(2*sin(θ/2))
+        let radius = chord_length / (2.0 * central_angle.sin());
+
+        // Calculate sagitta (height of arc from chord)
+        let sagitta = radius * (1.0 - central_angle.cos());
+
+        // Calculate perpendicular vector to chord
+        let dx = end.x - start.x;
+        let dy = end.y - start.y;
+
+        // Direction depends on angle sign
+        let sign = if angle < 0.0 { -1.0 } else { 1.0 };
+        let perp_x = -dy * sign;
+        let perp_y = dx * sign;
+
+        // Normalize perpendicular vector
+        let perp_length = f32::sqrt(perp_x.powi(2) + perp_y.powi(2));
+        let unit_perp_x = perp_x / perp_length;
+        let unit_perp_y = perp_y / perp_length;
+
+        // Calculate arc midpoint
+        Point2D {
+            x: chord_mid.x + unit_perp_x * sagitta,
+            y: chord_mid.y + unit_perp_y * sagitta,
+        }
+    }
+
+    fn get_point_on_arc(start: Point2D, end: Point2D, mut angle: f32, t: f32) -> Point2D {
+        // For major arcs, flip the direction to match SVG arc behavior
+        if angle.abs() > 180.0 {
+            angle = -angle;
+        }
+
+        // Calculate chord properties
+        let dx = end.x - start.x;
+        let dy = end.y - start.y;
+        let chord_length = (dx * dx + dy * dy).sqrt();
+        let angle_radians = angle * PI / 180.0;
+
+        // Calculate radius and center
+        let radius = (chord_length / 2.0) / (angle_radians.abs() / 2.0).sin();
+
+        // Find the middle point of the chord
+        let mid_x = (start.x + end.x) / 2.0;
+        let mid_y = (start.y + end.y) / 2.0;
+
+        // Calculate the center point
+        let direction = if angle >= 0.0 { 1.0 } else { -1.0 };
+        let center_distance = (radius * radius - (chord_length * chord_length / 4.0)).sqrt();
+        let normalized_dx = dx / chord_length;
+        let normalized_dy = dy / chord_length;
+        let center_x = mid_x - direction * center_distance * normalized_dy;
+        let center_y = mid_y + direction * center_distance * normalized_dx;
+
+        // Calculate angles relative to center
+        let start_angle = (start.y - center_y).atan2(start.x - center_x);
+        let end_angle = (end.y - center_y).atan2(end.x - center_x);
+
+        // Calculate smaller angle between start and end
+        let mut delta_angle = end_angle - start_angle;
+
+        // Normalize to -2PI to 2PI range
+        delta_angle = delta_angle % (2.0 * PI);
+
+        // Convert to -PI to PI range
+        if delta_angle > PI {
+            delta_angle -= 2.0 * PI;
+        }
+        if delta_angle < -PI {
+            delta_angle += 2.0 * PI;
+        }
+
+        // For major arcs, take the long way around
+        if (angle >= 0.0 && angle > 180.0) || (angle < 0.0 && angle < -180.0) {
+            if delta_angle >= 0.0 {
+                delta_angle -= 2.0 * PI;
+            } else {
+                delta_angle += 2.0 * PI;
+            }
+        }
+
+        // Interpolate the angle
+        let interpolated_angle = start_angle + delta_angle * t;
+
+        // Calculate final point position
+        Point2D {
+            x: center_x + radius * interpolated_angle.cos(),
+            y: center_y + radius * interpolated_angle.sin(),
+        }
+    }
+
+    fn get_arc_length(start: Point2D, end: Point2D, angle_degrees: f32) -> f32 {
+        // Calculate chord length using distance formula
+        let dx = end.x - start.x;
+        let dy = end.y - start.y;
+        let chord_length = (dx * dx + dy * dy).sqrt();
+
+        // Convert angle to radians (using absolute value for the formula)
+        let angle_radians = angle_degrees.abs() * PI / 180.0;
+
+        // Calculate radius using formula: R = (chord length/2) / sin(angle/2)
+        let radius = (chord_length / 2.0) / (angle_radians / 2.0).sin();
+
+        // Calculate arc length using formula: L = R * angle (in radians)
+        radius * angle_radians
+    }
+
+    fn interpolate_arc_points(start: Point2D, end: Point2D, angle: f32, density: f32) -> Vec<Point2D> {
+        let length = Self::get_arc_length(start, end, angle);
+
+        let num_points = (length * density).round() as usize;
+
+        if num_points == 0 {
+            return Vec::new();
+        }
+
+        (1..=num_points)
+            .map(|i| {
+                let t = i as f32 / (num_points + 1) as f32;
+                Self::get_point_on_arc(start, end, angle, t)
+            })
+            .collect()
+    }
+
+    fn expand_bbox_to_shape(command: &PathCommand, min: &mut Point2D, max: &mut Point2D) {
+        match command {
+            PathCommand::MoveTo { position } => {
+                min.x = min.x.min(position.x);
+                min.y = min.y.min(position.y);
+                max.x = max.x.max(position.x);
+                max.y = max.y.max(position.y);
+            }
+            PathCommand::LineTo { position } => {
+                min.x = min.x.min(position.x);
+                min.y = min.y.min(position.y);
+                max.x = max.x.max(position.x);
+                max.y = max.y.max(position.y);
+            }
+            PathCommand::ArcTo { end, rotation: _ } |
+            PathCommand::CenterArcTo { end, rotation: _ } => {
+                min.x = min.x.min(end.x);
+                min.y = min.y.min(end.y);
+                max.x = max.x.max(end.x);
+                max.y = max.y.max(end.y);
+            }
+            PathCommand::Circle { center, radius } => {
+                assert!(*radius >= 0.0, "Circles with negative radius are not supported");
+
+                min.x = min.x.min(center.x - radius);
+                min.y = min.y.min(center.y - radius);
+                max.x = max.x.max(center.x + radius);
+                max.y = max.y.max(center.y + radius);
+            }
+            PathCommand::Rectangle { start, width, height, rotation, .. } => {
+                assert!(*width >= 0.0 && *height >= 0.0, "Rectangles with negative sizes are not supported");
+
+                // Convert rotation to radians
+                let rotation_rad = rotation.to_radians();
+                let cos_rot = rotation_rad.cos();
+                let sin_rot = rotation_rad.sin();
+
+                // Calculate all four corners of the rectangle
+                let corners = [
+                    start,  // top-left
+                    &Point2D {  // top-right
+                        x: start.x + width * cos_rot,
+                        y: start.y + width * sin_rot,
+                    },
+                    &Point2D {  // bottom-left
+                        x: start.x - height * sin_rot,
+                        y: start.y + height * cos_rot,
+                    },
+                    &Point2D {  // bottom-right
+                        x: start.x + width * cos_rot - height * sin_rot,
+                        y: start.y + width * sin_rot + height * cos_rot,
+                    }
+                ];
+
+                // Update bounding box to include all corners
+                for corner in corners.iter() {
+                    min.x = min.x.min(corner.x);
+                    min.y = min.y.min(corner.y);
+                    max.x = max.x.max(corner.x);
+                    max.y = max.y.max(corner.y);
+                }
+            }
+        }
     }
 }
 
@@ -816,6 +1221,21 @@ pub struct StringObject {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct Image {
+    pub id: String,
+    pub group_id: u32,
+    pub layer_id: u8,
+    pub start_x: f32,
+    pub start_y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub angle: f32,
+    pub is_mirrored: bool,
+    pub path: Vec<Value>,
+    pub is_locked: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Pad {
     pub id: String,
     pub group_id: u32,
@@ -843,6 +1263,25 @@ pub struct Pad {
     pub spoke_space: Option<f32>,
     pub spoke_width: Option<f32>,
     pub spoke_angle: Option<f32>,
+    pub unused_inner_layers: Option<Value>,
+
+    pub attributes: Vec<Attribute>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Via {
+    pub id: String,
+    pub group_id: u32,
+    pub name: String,
+    pub net: String,
+    pub center_x: f32,
+    pub center_y: f32,
+    pub hole_diameter: f32,
+    pub via_diameter: f32,
+    pub is_suture: bool,
+    pub top_solder_expansion: Option<f32>,
+    pub bottom_solder_expansion: Option<f32>,
+    pub is_locked: bool,
     pub unused_inner_layers: Option<Value>,
 
     pub attributes: Vec<Attribute>,
@@ -900,11 +1339,13 @@ pub enum FootprintProperty {
     FILL(Fill),
     POLY(Poly),
     PAD(Pad),
+    VIA(Via),
     NET(Net),
     RULE_TEMPLATE(RuleTemplate),
     RULE(Rule),
     PRIMITIVE(Primitive),
     STRING(StringObject),
+    IMAGE(Image),
     ATTR(Attribute),
     CANVAS(Canvas),
 }
@@ -1074,6 +1515,29 @@ impl FootprintProperty {
 
                 Ok(Some(FootprintProperty::PAD(pad)))
             }
+            "VIA" => {
+                if reader.remaining() < 12 {
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
+                }
+
+                Ok(Some(FootprintProperty::VIA(Via {
+                    id: reader.read_string().unwrap(),
+                    group_id: reader.read_u32().unwrap(),
+                    name: reader.read_string().unwrap(),
+                    net: reader.read_string().unwrap(),
+                    center_x: reader.read_f32().unwrap(),
+                    center_y: reader.read_f32().unwrap(),
+                    hole_diameter: reader.read_f32().unwrap(),
+                    via_diameter: reader.read_f32().unwrap(),
+                    is_suture: reader.read_bool().unwrap(),
+                    top_solder_expansion: reader.read_f32(),
+                    bottom_solder_expansion: reader.read_f32(),
+                    is_locked: reader.read_bool().unwrap(),
+                    unused_inner_layers: if reader.can_read() { reader.read_value() } else { None },
+
+                    attributes: Vec::new(),
+                })))
+            }
             "NET" => {
                 if reader.remaining() != 7 {
                     return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
@@ -1146,6 +1610,26 @@ impl FootprintProperty {
                     is_locked: reader.read_bool().unwrap(),
                 })))
             }
+            "IMAGE" => {
+                if reader.remaining() != 11 {
+                    return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));
+                }
+
+                Ok(Some(FootprintProperty::IMAGE(Image {
+                    id: reader.read_string().unwrap(),
+                    group_id: reader.read_u32().unwrap(),
+                    layer_id: reader.read_u8().unwrap(),
+                    start_x: reader.read_f32().unwrap(),
+                    start_y: reader.read_f32().unwrap(),
+                    width: reader.read_f32().unwrap(),
+                    height: reader.read_f32().unwrap(),
+                    angle: reader.read_f32().unwrap(),
+                    is_mirrored: reader.read_bool().unwrap(),
+                    path: reader.read_value().unwrap().as_array().unwrap().clone(),
+                    is_locked: reader.read_bool().unwrap(),
+                })))
+            }
+            "FONT" => { Ok(None) }
             "ATTR" => {
                 if reader.remaining() != 21 {
                     return Err(ParserError::InvalidArrayLength(ParserType::Footprint, property_type.into()));

@@ -28,6 +28,7 @@ pub struct FootprintLibrary {
     pub circles: Vec<FootprintCircle>,
     pub rectangles: Vec<FootprintRectangle>,
     pub arcs: Vec<FootprintArc>,
+
     pub texts: Vec<FootprintText>,
     pub pads: Vec<FootprintPad>,
     pub zones: Vec<FootprintZone>,
@@ -113,6 +114,7 @@ pub struct FootprintRectangle {
     pub locked: bool,
 }
 
+#[allow(unused)]
 #[derive(Debug)]
 // https://dev-docs.kicad.org/en/file-formats/sexpr-intro/index.html#_footprint_pad
 pub struct FootprintPad {
@@ -192,6 +194,7 @@ pub struct DrillDefinition {
     pub offset: Option<Scalar2D>,
 }
 
+#[allow(unused)]
 #[derive(Debug)]
 pub struct Net {
     pub number: usize,
@@ -208,6 +211,7 @@ pub enum PadProperty {
     Castellated,
 }
 
+#[allow(unused)]
 #[derive(Debug)]
 pub enum PadChamfer {
     TopLeft,
@@ -616,6 +620,92 @@ impl PcbLayer {
             PcbLayer::In30Cu,
             PcbLayer::BCu,
         ]
+    }
+}
+
+pub trait PrimitivesContainer {
+    fn add_line(&mut self, line: FootprintLine);
+    fn add_polygon(&mut self, polygon: FootprintPolygon);
+    fn add_circle(&mut self, circle: FootprintCircle);
+    fn add_rectangle(&mut self, rectangle: FootprintRectangle);
+    fn add_arc(&mut self, arc: FootprintArc);
+}
+
+impl PrimitivesContainer for FootprintLibrary {
+    fn add_line(&mut self, line: FootprintLine) {
+        self.lines.push(line);
+    }
+
+    fn add_polygon(&mut self, polygon: FootprintPolygon) {
+        self.polygons.push(polygon);
+    }
+
+    fn add_circle(&mut self, circle: FootprintCircle) {
+        self.circles.push(circle);
+    }
+
+    fn add_rectangle(&mut self, rectangle: FootprintRectangle) {
+        self.rectangles.push(rectangle);
+    }
+
+    fn add_arc(&mut self, arc: FootprintArc) {
+        self.arcs.push(arc);
+    }
+}
+
+impl PrimitivesContainer for FootprintPadPrimitives {
+    fn add_line(&mut self, line: FootprintLine) {
+        self.lines.push(GraphicLine {
+            start: line.start,
+            end: line.end,
+            angle: None,
+            width: line.width.unwrap(),
+            layer: Some(line.layer),
+            uuid: line.uuid,
+        });
+    }
+
+    fn add_polygon(&mut self, polygon: FootprintPolygon) {
+        self.polygons.push(GraphicPolygon {
+            points: polygon.points,
+            fill: polygon.fill,
+            width: polygon.width,
+            layer: Some(polygon.layer),
+            uuid: polygon.uuid,
+        });
+    }
+
+    fn add_circle(&mut self, circle: FootprintCircle) {
+        self.circles.push(GraphicCircle {
+            center: circle.center,
+            end: circle.end,
+            fill: circle.fill,
+            width: circle.width.unwrap(),
+            layer: Some(circle.layer),
+            uuid: circle.uuid,
+        });
+    }
+
+    fn add_rectangle(&mut self, rectangle: FootprintRectangle) {
+        self.rectangles.push(GraphicRectangle {
+            start: rectangle.start,
+            end: rectangle.end,
+            fill: rectangle.fill,
+            width: rectangle.width.unwrap(),
+            layer: Some(rectangle.layer),
+            uuid: rectangle.uuid,
+        });
+    }
+
+    fn add_arc(&mut self, arc: FootprintArc) {
+        self.arcs.push(GraphicArc {
+            start: arc.start,
+            mid: arc.mid.unwrap(),
+            end: arc.end,
+            width: arc.width.unwrap(),
+            layer: Some(arc.layer),
+            uuid: arc.uuid,
+        });
     }
 }
 
@@ -1414,7 +1504,7 @@ impl SyntaxItemSerializable for FootprintPad {
             }).into(), PositionPreference::None)));
         }
 
-        let mut arguments = vec![
+        let arguments = vec![
             match self.number.as_str() {
                 "" => SyntaxArgument::QuotedString("".into(), PositionPreference::Start),
                 str => SyntaxArgument::Identifier(str.into(), PositionPreference::Start),
@@ -1443,7 +1533,7 @@ impl SyntaxItemSerializable for FootprintPad {
     }
 
     fn deserialize(syntax: &SyntaxItem) -> Self {
-        let mut pad = Self {
+        let pad = Self {
             number: syntax.arguments.get(0).unwrap().get_string(),
             pad_type: match syntax.arguments.get(1).unwrap().get_string().as_str() {
                 "thru_hole" => PadType::ThruHole,
@@ -2021,7 +2111,7 @@ impl SyntaxItemSerializable for Vec<PcbLayer> {
             let argument = argument.get_string();
 
             let parts = argument.split('.').collect::<Vec<&str>>();
-            layers.extend(layer_map.iter().filter(|(a, b)| {
+            layers.extend(layer_map.iter().filter(|(a, _b)| {
                 let this_parts = a.split('.').collect::<Vec<&str>>();
                 let type_match = this_parts[0] == parts[0] || parts[0] == "*";
                 let name_match = this_parts[1] == parts[1] || parts[1] == "*";
@@ -2038,6 +2128,23 @@ impl SyntaxItemSerializable for Vec<PcbLayer> {
         }
 
         layers
+    }
+}
+
+impl SyntaxItemSerializable for PcbLayer {
+    fn serialize(&self) -> SyntaxItem {
+        SyntaxItem {
+            name: "layer".into(),
+            children: vec![],
+            arguments: vec![
+                SyntaxArgument::Identifier(self.to_string(), PositionPreference::None),
+            ],
+        }
+    }
+
+    fn deserialize(syntax: &SyntaxItem) -> Self {
+        let layer_name = syntax.arguments.first().unwrap().get_string();
+        PcbLayer::parse(&layer_name)
     }
 }
 

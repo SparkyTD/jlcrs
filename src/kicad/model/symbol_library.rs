@@ -1,3 +1,4 @@
+use crate::easyeda::symbol::Object;
 use crate::kicad::model::common::{Id, Position, StrokeDefinition, TextEffect, TextPosition};
 use crate::kicad::syntax::{PositionPreference, SyntaxArgument, SyntaxItem, SyntaxItemSerializable, TopLevelSerializable};
 
@@ -9,6 +10,7 @@ pub struct SymbolLib {
     pub symbols: Vec<Symbol>,
 }
 
+#[allow(unused)]
 #[derive(Debug, Default)]
 pub struct Symbol {
     pub symbol_id: String,
@@ -22,6 +24,7 @@ pub struct Symbol {
     pub properties: Vec<Property>,
 
     pub arcs: Vec<SymbolArc>,
+    pub beziers: Vec<SymbolArc>,
     pub circles: Vec<SymbolCircle>,
     pub rectangles: Vec<SymbolRectangle>,
     pub lines: Vec<SymbolLine>,
@@ -30,6 +33,7 @@ pub struct Symbol {
 
     pub pins: Vec<SymbolPin>,
     pub units: Vec<Symbol>,
+    pub objects: Vec<Object>,
     pub unit_name: Option<String>,
 }
 
@@ -306,11 +310,13 @@ impl SyntaxItemSerializable for Symbol {
             properties: Vec::new(),
             pins: Vec::new(),
             arcs: Vec::new(),
+            beziers: Vec::new(),
             circles: Vec::new(),
             rectangles: Vec::new(),
             lines: Vec::new(),
             curves: Vec::new(),
             texts: Vec::new(),
+            objects: Vec::new(),
             units: Vec::new(),
             extends_id: None,
             unit_name: None,
@@ -341,6 +347,7 @@ impl SyntaxItemSerializable for Symbol {
                         .and_then(|c| Some(c.arguments.first().unwrap().get_number()))
                 }
                 "symbol" => symbol.units.push(Symbol::deserialize(&child)),
+                "embedded_fonts" => {},
                 _ => panic!("Unsupported child item type in Symbol: {}", child.name)
             }
         }

@@ -1,12 +1,13 @@
-use std::collections::HashMap;
-use itertools::Itertools;
+use crate::easyeda::geometry::Point2D;
 use crate::easyeda::json_reader::JsonArrayReader;
-use crate::easyeda::{ParserError, ParserType};
-use crate::kicad::model::common::{Font, FontSize, Position, StrokeDefinition, TextEffect, TextJustifyHorizontal, TextJustifyVertical, TextPosition};
+use crate::easyeda::errors::{ParserError, ParserType, SymbolConverterError};
+use crate::kicad::model::common::{FontSize, Position, StrokeDefinition, TextEffect, TextJustifyHorizontal, TextJustifyVertical, TextPosition};
 use crate::kicad::model::symbol_library::{Color, FillDefinition, FillType, PinElectricalType, PinGraphicStyle, StrokeType, Symbol, SymbolArc, SymbolCircle, SymbolLib, SymbolLine, SymbolPin, SymbolRectangle, SymbolText};
+use itertools::Itertools;
 use num_derive::FromPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 pub struct EasyEDASymbol {
     pub elements: Vec<SymbolElement>,
@@ -15,11 +16,6 @@ pub struct EasyEDASymbol {
 }
 
 impl EasyEDASymbol {
-    pub fn load_and_parse(path: &str) -> anyhow::Result<EasyEDASymbol> {
-        let data = std::fs::read_to_string(path)?;
-        Self::parse(&data)
-    }
-
     pub fn parse(symbol_data: &str) -> anyhow::Result<EasyEDASymbol> {
         let mut elements = Vec::new();
 
@@ -42,28 +38,43 @@ impl EasyEDASymbol {
             elements,
         })
     }
-}
 
-impl Into<SymbolLib> for EasyEDASymbol {
-    fn into(self) -> SymbolLib {
-        SymbolLib {
-            version: 20211014,
-            generator: "easyeda-to-kicad".into(),
-            generator_version: None,
-            symbols: vec![self.into()],
+    pub fn get_designator(&self) -> Option<String> {
+        for element in &self.elements {
+            if let SymbolElement::ATTR(attribute) = element {
+                if attribute.key != "Designator" {
+                    continue;
+                }
+
+                if attribute.parent_id.clone().is_none_or(|s| s.is_empty()) {
+                    return attribute.value.clone();
+                }
+            }
         }
+
+        None
     }
 }
 
-impl Into<Symbol> for EasyEDASymbol {
-    fn into(self) -> Symbol {
-        let default_text_effect = TextEffect {
-            font: Font {
-                size: FontSize { width: 1.27, height: 1.27 },
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+impl TryInto<SymbolLib> for EasyEDASymbol {
+    type Error = SymbolConverterError;
+
+    fn try_into(self) -> Result<SymbolLib, Self::Error> {
+        let symbol = self.try_into()?;
+        Ok(SymbolLib {
+            version: 20211014,
+            generator: "easyeda-to-kicad".into(),
+            generator_version: None,
+            symbols: vec![symbol],
+        })
+    }
+}
+
+impl TryInto<Symbol> for EasyEDASymbol {
+    type Error = SymbolConverterError;
+
+    fn try_into(self) -> Result<Symbol, Self::Error> {
+        let default_text_effect = TextEffect::default();
 
         let scale_factor = 0.254;
 
@@ -78,8 +89,6 @@ impl Into<Symbol> for EasyEDASymbol {
                 _ => None,
             }).collect_vec();
         let is_complex_symbol = all_parts.len() > 1;
-
-        // root_symbol.symbol_id = "complex".into();
 
         let mut all_symbols = Vec::new();
         let mut current_symbol_index = usize::MAX;
@@ -120,7 +129,6 @@ impl Into<Symbol> for EasyEDASymbol {
                     text_styles.insert(style.index_name.clone(), style);
                 }
                 SymbolElement::PART(part) => {
-                    // current_symbol.symbol_id = part.id.clone();
                     let symbol = Symbol {
                         symbol_id: part.id.clone(),
                         in_bom: Some(true),
@@ -186,7 +194,7 @@ impl Into<Symbol> for EasyEDASymbol {
                             },
                         });
                     } else {
-                        panic!("Ellipses are not supported by KiCAD");
+                        return Err(SymbolConverterError::UnsupportedElement("Ellipse".into()));
                     }
                 }
                 SymbolElement::POLYLINE(line) => {
@@ -221,6 +229,10 @@ impl Into<Symbol> for EasyEDASymbol {
                         },
                     });
                 }
+                SymbolElement::BEZIER(_bezier) => {
+                    // todo implement bezier
+                    return Err(SymbolConverterError::UnsupportedElement("Bezier".into()));
+                }
                 SymbolElement::TEXT(text) => {
                     let current_symbol = all_symbols.get_mut(current_symbol_index).unwrap();
                     let mut text_style = default_text_effect.clone();
@@ -254,13 +266,26 @@ impl Into<Symbol> for EasyEDASymbol {
                 }
                 SymbolElement::PIN(pin) => {
                     let current_symbol = all_symbols.get_mut(current_symbol_index).unwrap();
-                    let name = attributes.iter().filter(|a| a.key == "NAME").last().unwrap();
-                    let number = attributes.iter().filter(|a| a.key == "NUMBER").last().unwrap();
+                    let number_attr = attributes.iter().filter(|a| a.key == "NUMBER").last().unwrap();
+                    let name_attr = attributes.iter().filter(|a| a.key == "NAME").last().unwrap();
+
+                    let number = number_attr.value.clone().unwrap();
+                    let mut name = name_attr.value.clone().unwrap();
+                    if number == name {
+                        name = "~".into();
+                    }
+
                     current_symbol.pins.push(SymbolPin {
                         position: Position { x: pin.x * scale_factor, y: pin.y * scale_factor, angle: Some(pin.rotation) },
                         length: pin.length * scale_factor,
-                        number: Some(number.value.clone().unwrap()),
-                        name: Some(name.value.clone().unwrap()),
+                        number: match number_attr.value_visible.is_some_and(|b| b) {
+                            true => Some(number),
+                            false => None,
+                        },
+                        name: match name_attr.value_visible.is_some_and(|b| b) {
+                            true => Some(name),
+                            false => None,
+                        },
                         name_effects: default_text_effect.clone(),
                         number_effects: default_text_effect.clone(),
                         graphic_style: match pin.pin_shape {
@@ -272,21 +297,13 @@ impl Into<Symbol> for EasyEDASymbol {
                         electrical_type: PinElectricalType::Unspecified,
                     });
                 }
+                SymbolElement::OBJ(obj) => {
+                    let current_symbol = all_symbols.get_mut(current_symbol_index).unwrap();
+                    current_symbol.objects.push(obj);
+                }
 
                 SymbolElement::DOCTYPE(_) | SymbolElement::HEAD(_) => {}
             }
-        }
-
-        // todo
-        if let Some(part_number) = self.part_number {
-            /*kicad_symbol.properties.push(Property {
-                id: None,
-                key: "LCSC".into(),
-                value: part_number,
-                hide: true,
-                position: Position::default(),
-                text_effects: default_text_effect.clone(),
-            });*/
         }
 
         let mut root_symbol = Symbol {
@@ -307,7 +324,7 @@ impl Into<Symbol> for EasyEDASymbol {
 
             // Check overall sequence formatting
             if name_parts.iter().any(|p| p.clone().is_none_or(|(_, id)| id.is_err())) {
-                panic!("One or more symbol sub-unit names are incorrectly formatted.")
+                return Err(SymbolConverterError::IncorrectUnitFormat(format!("{:?}", name_parts)));
             }
 
             let name_parts = name_parts.into_iter()
@@ -319,12 +336,12 @@ impl Into<Symbol> for EasyEDASymbol {
                 .map(|p| p.1).zip_eq(1..name_parts.len() + 1)
                 .all(|(a, b)| a == b);
             if !sequence_okay {
-                panic!("One or more symbol sub-unit names have an incorrect numeric identifier.")
+                return Err(SymbolConverterError::IncorrectUnitNumIdentifier(format!("{:?}", name_parts)));
             }
 
             // Check base part matches
             if !name_parts.windows(2).all(|w| w[0].0 == w[1].0) {
-                panic!("One or more symbol sub-unit names have an incorrect name.")
+                return Err(SymbolConverterError::IncorrectUnitName(format!("{:?}", name_parts)));
             }
 
             root_symbol.symbol_id = name_parts.first().unwrap().0.clone();
@@ -345,7 +362,7 @@ impl Into<Symbol> for EasyEDASymbol {
 
         // todo add basic properties to root
 
-        root_symbol
+        Ok(root_symbol)
     }
 }
 
@@ -472,6 +489,14 @@ pub struct Arc {
     pub is_locked: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Bezier {
+    pub id: String,
+    pub control_points: Vec<Point2D>,
+    pub style_id: Option<String>,
+    pub is_locked: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize, FromPrimitive)]
 pub enum PinShape {
     None = 0,
@@ -506,6 +531,20 @@ pub struct Text {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct Object {
+    pub id: String,
+    pub file_name: String,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub rotation: f32,
+    pub is_mirrored: bool,
+    pub data_url: String,
+    pub is_locked: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub enum SymbolElement {
     DOCTYPE(DocType),
     HEAD(Head),
@@ -518,14 +557,10 @@ pub enum SymbolElement {
     ELLIPSE(Ellipse),
     POLYLINE(PolyLine),
     ARC(Arc),
+    BEZIER(Bezier),
     PIN(Pin),
     TEXT(Text),
-}
-
-trait HasAttributes {
-    fn get_id(&self) -> &str;
-    fn get_attributes(&self) -> &Vec<Attribute>;
-    fn get_attributes_mut(&mut self) -> &mut Vec<Attribute>;
+    OBJ(Object),
 }
 
 impl SymbolElement {
@@ -720,6 +755,19 @@ impl SymbolElement {
                     is_locked: reader.read_bool().unwrap(),
                 })))
             }
+            "BEZIER" => {
+                if reader.remaining() != 4 {
+                    return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
+                }
+
+                Ok(Some(SymbolElement::BEZIER(Bezier {
+                    id: reader.read_string().unwrap(),
+                    control_points: reader.read_value().unwrap().as_array().clone()
+                        .unwrap().windows(2).map(|a| Point2D::new(a[0].as_f64().unwrap() as f32, a[1].as_f64().unwrap() as f32)).collect(),
+                    style_id: reader.read_string(),
+                    is_locked: reader.read_bool().unwrap(),
+                })))
+            }
             "TEXT" => {
                 if reader.remaining() != 6 {
                     return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
@@ -736,7 +784,8 @@ impl SymbolElement {
                 })))
             }
             "PIN" => {
-                if reader.remaining() != 11 {
+                let param_count = reader.remaining();
+                if param_count != 11 && param_count != 10 {
                     return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
                 }
 
@@ -749,7 +798,26 @@ impl SymbolElement {
                     length: reader.read_f32().unwrap(),
                     rotation: reader.read_f32().unwrap(),
                     pin_color: reader.read_string(),
-                    pin_shape: reader.read_enum().unwrap(),
+                    pin_shape: if param_count == 10 { PinShape::None } else { reader.read_enum().unwrap() },
+                    is_locked: reader.read_bool().unwrap(),
+                })))
+            }
+            "OBJ" => {
+                let param_count = reader.remaining();
+                if param_count != 10 {
+                    return Err(ParserError::InvalidArrayLength(ParserType::Symbol, property_type.into()));
+                }
+
+                Ok(Some(SymbolElement::OBJ(Object {
+                    id: reader.read_string().unwrap(),
+                    file_name: reader.read_string().unwrap(),
+                    x: reader.read_f32().unwrap(),
+                    y: reader.read_f32().unwrap(),
+                    width: reader.read_f32().unwrap(),
+                    height: reader.read_f32().unwrap(),
+                    rotation: reader.read_f32().unwrap(),
+                    is_mirrored: reader.read_bool().unwrap(),
+                    data_url: reader.read_string().unwrap(),
                     is_locked: reader.read_bool().unwrap(),
                 })))
             }

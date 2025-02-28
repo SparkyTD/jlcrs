@@ -1,11 +1,13 @@
 use num_traits::FromPrimitive;
 use serde_json::Value;
 
+#[derive(Debug)]
 pub struct JsonArrayReader {
     array: Vec<Value>,
     index: usize,
 }
 
+#[allow(unused)]
 impl JsonArrayReader {
     pub fn new(array: Vec<Value>) -> Self {
         Self { array, index: 0 }

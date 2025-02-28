@@ -1,143 +1,253 @@
-use crate::easyeda::footprint::EasyEDAFootprint;
-use crate::easyeda::symbol::SymbolElement;
-use crate::kicad::model::symbol_library::SymbolLib;
-use actix_web::{post, web, App, HttpResponse, HttpServer, Responder};
-use kicad::model::footprint_library::FootprintLibrary;
-use kicad::syntax::SyntaxItemSerializable;
-use kicad::syntax::{KiCadParser, TopLevelSerializable};
-use proc_macro2::TokenStream;
 use std::fs;
-use svg::node::NodeClone;
+use crate::args::{CliArguments, Command};
+use clap::Parser;
+use crate::easyeda::api::component_data::ComponentDataResponse;
+use crate::easyeda::api::product_data::ProductDataResponse;
+use crate::easyeda::footprint::EasyEDAFootprint;
+use crate::easyeda::symbol::EasyEDASymbol;
+use crate::kicad::model::footprint_lib_table::{FootprintLibTable, FootprintLibTableItem};
+use crate::kicad::model::footprint_library::{FootprintLibrary, FootprintModel};
+use crate::kicad::model::symbol_lib_table::{SymbolLibTable, SymbolLibTableItem};
+use crate::kicad::model::symbol_library::{Symbol, SymbolLib};
+use crate::kicad::syntax::{KiCadParser, SyntaxItemSerializable};
 
 mod kicad;
 mod easyeda;
-
-fn test_parse_file<T>(str: &str) -> anyhow::Result<bool>
-where
-    T: TopLevelSerializable,
-{
-    let tokens = KiCadParser::tokenize(&str);
-    let item = KiCadParser::parse_syntax_item(&tokens);
-    let model: T = SyntaxItemSerializable::deserialize(&item);
-
-    let item_ser = model.serialize();
-    let tokens = KiCadParser::generate_tokens(&item_ser);
-    let string = KiCadParser::stringify_tokens::<T>(&tokens);
-
-    let matches = item_ser.deep_equals(&item);
-
-    println!("Match: {}", matches);
-
-    if !matches {
-        println!("{}", string);
-    }
-
-    Ok(matches)
-}
-
-pub fn test_derive(input: TokenStream) -> TokenStream {
-    input
-}
-
-fn main7() -> anyhow::Result<()> {
-    let test_input_sym = fs::read_to_string("/home/sparky/HardwareProjects/iot-controller/lfxp2-5e-5tn144.kicad_sym")?;
-
-    test_parse_file::<SymbolLib>(&test_input_sym)?;
-
-    Ok(())
-}
-
+mod dev;
+mod args;
 
 fn main() -> anyhow::Result<()> {
-    // [OK] C1338621 - STM32-L1
-    // [OK] C2765186 - USB-C
-    // [OK] C136421 - HDMI
-    // [OK] C105419 - MicroSD
-    // [OK] C2803250 - SDRAM
-    // [OK] C5446699 - RGB LED
-    // [OK] C21190 - Resistor
+    let cli = CliArguments::parse();
+    match cli.command {
+        Command::Import { code, update, name, description, root } => {
+            let project_root_dir = std::env::current_dir()?;
 
-    // [OK] C2913204 - ESP32-S3-WROOM-1-N8R2
-    // [OK] C165948 - UsbC Connector - TYPE-C-31-M-12
-    // [OK] C18191948 - MOSFET - IRLR7843TRPBF-JSM
-    // [OK] C93168 - Relay - G6K-2F-Y DC3
-    // [OK] C8545 - MOSFET - 2N7002
-    // [OK] C474923 - Screw Terminal Block - KF128-2.54-5P
-    // [OK] C474920 - Screw Terminal Block - KF128-2.54-2P
-    // [OK] C318884 - SMD Button - TS-1187A-B-A-B
-    // [OK] C2874116 - RGB LED - NH-B2020RGBA-HF
-    // [OK] C841386 - DC-Dc Regulator TPS56637RPA
-    let (mut symbol, footprint) = easyeda::tests::download_component("C136421")?;
-
-    let is_complex_symbol = symbol.elements.iter()
-        .filter(|e| match e {
-            SymbolElement::PART(_) => true,
-            _ => false,
-        })
-        .count() > 1;
-    let mut index = 1;
-    for element in &mut symbol.elements {
-        match element {
-            SymbolElement::PART(part) => {
-                part.id = if is_complex_symbol { format!("test.{}", index) } else { "test".into() };
-                index += 1;
+            let mut library_root_dir = std::env::current_dir()?;
+            let library_name = sanitize_filename::sanitize(&name);
+            let library_name = library_name.as_str();
+            if let Some(root) = root {
+                library_root_dir = library_root_dir.join(root);
+                if !library_root_dir.exists() {
+                    fs::create_dir_all(&library_root_dir)?;
+                }
             }
-            _ => {}
-        }
-    }
 
-    let mut kicad_symbol_lib: SymbolLib = symbol.into();
+            let library_path_relative = library_root_dir.to_str().unwrap().replace(project_root_dir.to_str().unwrap(), "${{KIPRJMOD}}");
 
-    let item = kicad_symbol_lib.serialize();
-    let tokens = KiCadParser::generate_tokens(&item);
-    let sym_string = KiCadParser::stringify_tokens::<SymbolLib>(&tokens);
-    //println!("{}", string);
+            let lcsc_code = code[1..].parse::<u32>();
+            if !code.starts_with("C") || lcsc_code.is_err() {
+                return Err(anyhow::anyhow!("The provided LCSC code is in an invalid format."));
+            }
+            let lcsc_code = format!("C{}", lcsc_code?).clone();
+            let lcsc_code = lcsc_code.as_str();
 
-    let kicad_footprint: FootprintLibrary = footprint.into();
-    let item = kicad_footprint.serialize();
-    let tokens = KiCadParser::generate_tokens(&item);
-    let fp_string = KiCadParser::stringify_tokens::<SymbolLib>(&tokens);
+            println!("Importing '{}'...", lcsc_code);
 
-    //println!("{}", fp_string);
-    fs::write("/home/sparky/HardwareProjects/iot-controller/test-library.pretty/test-footprint.kicad_mod", fp_string)?;
+            // Download component data
+            let response = ureq::get(
+                format!("https://pro.easyeda.com/api/eda/product/search?keyword={code}&currPage=1&pageSize=1")
+            ).call()?;
+            let body_string = response.into_body().read_to_string()?;
+            let response = serde_json::from_str::<ProductDataResponse>(&body_string)?;
+            let result = response.result.product_list.iter().find(|p| p.number == code);
+            if let None = result {
+                return Err(anyhow::anyhow!("Product code not found: '{}'", lcsc_code));
+            }
+            let component_result = result.unwrap();
+            let device_name = component_result.mpn.clone();
+            let safe_part_name = sanitize_filename::sanitize(&device_name);
 
-    //println!("{}", sym_string);
-    fs::write("/home/sparky/HardwareProjects/iot-controller/test-symbol.kicad_sym", sym_string)?;
+            let mut symbol = EasyEDASymbol::parse(&component_result.device_info.symbol_info.data_str)?;
+            let mut footprint = EasyEDAFootprint::parse(&component_result.device_info.footprint_info.data_str)?;
 
-    println!("All done!");
-    Ok(())
-}
+            symbol.part_number = Some(lcsc_code.into());
+            footprint.part_number = Some(lcsc_code.into());
 
-#[post("/footprint")]
-async fn handle_footprint(body: web::Bytes) -> HttpResponse {
-    let raw_str = String::from_utf8(body.to_vec()).unwrap();
+            let designator = symbol.get_designator().clone();
 
-    match EasyEDAFootprint::parse(&raw_str) {
-        Ok(footprint) => {
-            println!("Footprint parsed successfully");
-            let kicad_footprint: FootprintLibrary = footprint.into();
+            let mut kicad_symbol: Symbol = symbol.try_into()?;
+            let mut kicad_footprint: FootprintLibrary = footprint.try_into()?;
+
+            kicad_symbol.symbol_id = device_name.clone();
+            kicad_footprint.footprint_id = device_name.clone();
+
+            // Add component properties
+            kicad_symbol.add_hidden_property("Part Number", device_name.as_str());
+            kicad_symbol.add_hidden_property("LCSC", lcsc_code);
+            kicad_symbol.add_hidden_property("Footprint", format!("{library_name}:{device_name}").as_str());
+            kicad_footprint.add_hidden_property("LCSC", lcsc_code);
+
+            if let Some(datasheet) = component_result.device_info.attributes.get("Datasheet") {
+                kicad_symbol.add_hidden_property("Datasheet", datasheet);
+                kicad_footprint.add_hidden_property("Datasheet", datasheet);
+            }
+            if let Some(description) = component_result.device_info.attributes.get("Description").cloned().or_else(|| Some(component_result.device_info.description.clone())) {
+                kicad_symbol.add_hidden_property("Description", &description);
+                kicad_footprint.add_hidden_property("Description", &description);
+                kicad_footprint.description = Some(description.clone());
+            }
+            if let Some(jlc_part_class) = component_result.device_info.attributes.get("JLCPCB Part Class") {
+                kicad_symbol.add_hidden_property("JLCPCB Part Class", jlc_part_class);
+                kicad_footprint.add_hidden_property("JLCPCB Part Class", jlc_part_class);
+            }
+            if let Some(value) = component_result.device_info.attributes.get("Value") {
+                kicad_symbol.add_property("Value", value.as_str(), 0.0, 0.0);
+            } else {
+                kicad_symbol.add_property("Value", device_name.as_str(), 0.0, 0.0);
+            }
+            if let Some(designator) = designator {
+                kicad_symbol.add_property("Reference", &designator, 0.0, 0.0);
+            }
+
+            // Check if symbol lib exists, create if it doesn't
+            let symbol_lib_path = library_root_dir.join(format!("{library_name}.kicad_sym").as_str());
+            let mut symbol_lib = match fs::exists(&symbol_lib_path)? {
+                true => {
+                    let lib_data = fs::read_to_string(&symbol_lib_path)?;
+                    let tokens = KiCadParser::tokenize(&lib_data);
+                    let item = KiCadParser::parse_syntax_item(&tokens);
+                    let model: SymbolLib = SyntaxItemSerializable::deserialize(&item);
+                    model
+                }
+                false => {
+                    SymbolLib {
+                        version: 20211014,
+                        generator: "jlcrs".into(),
+                        generator_version: None,
+                        symbols: vec![],
+                    }
+                }
+            };
+            let existing_component = symbol_lib.symbols.iter_mut().find(|s| s.symbol_id == kicad_symbol.symbol_id);
+            if !update && existing_component.is_some() {
+                return Err(anyhow::anyhow!("This component has already been imported into the project, aborting. Use the --update flag to overwrite an existing component."));
+            }
+            if existing_component.is_none() {
+                println!("Adding device '{}'...", device_name);
+                symbol_lib.symbols.push(kicad_symbol);
+            } else if let Some(existing_symbol) = existing_component {
+                *existing_symbol = kicad_symbol;
+            }
+
+            // Download STEP model data
+            let model_id = &component_result.device_info.footprint_info.model_3d.uri;
+            let response = ureq::get(format!("https://pro.easyeda.com/api/v2/components/{model_id}")).call();
+            if let Ok(model_response) = response {
+                let body_string = model_response.into_body().read_to_string()?;
+                let component_data = serde_json::from_str::<ComponentDataResponse>(&body_string)?;
+                if let Some(product_result) = component_data.result {
+                    let model_id = product_result.n3d_model_uuid;
+                    let response = ureq::get(format!("https://modules.easyeda.com/qAxj6KHrDKw4blvCG8QJPs7Y/{model_id}")).call();
+                    if let Ok(model_response) = response {
+                        let body_string = model_response.into_body().read_to_string()?;
+                        println!("Found STEP model, downloading...");
+                        let model_directory = library_root_dir
+                            .join(format!("{library_name}.pretty").as_str())
+                            .join("models");
+                        if !model_directory.exists() {
+                            fs::create_dir_all(&model_directory)?;
+                        }
+                        let model_path = model_directory.join(format!("{safe_part_name}.step"));
+                        fs::write(&model_path, body_string)?;
+
+                        kicad_footprint.model = Some(FootprintModel {
+                            model_file: model_path.to_str().unwrap().to_string(),
+                            opacity: None,
+                            offset: None,
+                            rotate: None,
+                            scale: None,
+                            at: None,
+                        });
+                    }
+                } else {
+                    println!("No STEP model was found for this component");
+                }
+            } else {
+                println!("No STEP model was found for this component");
+            }
+
+            let item_ser = symbol_lib.serialize();
+            let tokens = KiCadParser::generate_tokens(&item_ser);
+            let symbol_lib_data = KiCadParser::stringify_tokens::<SymbolLib>(&tokens);
+            fs::write(symbol_lib_path, symbol_lib_data)?;
+
+            // Save footprint to .pretty directory
+            let footprint_lib_root = library_root_dir.join(format!("{library_name}.pretty").as_str());
+            if !fs::exists(&footprint_lib_root)? {
+                fs::create_dir(&footprint_lib_root)?;
+            }
+            let footprint_path = footprint_lib_root.join(format!("{safe_part_name}.kicad_mod").as_str());
             let item = kicad_footprint.serialize();
             let tokens = KiCadParser::generate_tokens(&item);
-            let string = KiCadParser::stringify_tokens::<SymbolLib>(&tokens);
-            // println!("{}", string);
+            let footprint_data = KiCadParser::stringify_tokens::<FootprintLibrary>(&tokens);
+            fs::write(footprint_path, footprint_data)?;
 
-            fs::write("/home/sparky/HardwareProjects/iot-controller/test-library.pretty/test-footprint.kicad_mod", string).unwrap();
+            // Check if the sym-lib-table/fp-lib-table files exist, create them if they don't
+            let sym_lib_table_path = project_root_dir.join("sym-lib-table");
+            let mut sym_lib_table = match fs::exists(&sym_lib_table_path)? {
+                true => {
+                    let sym_lib_table_data = fs::read_to_string(&sym_lib_table_path.to_str().unwrap())?;
+                    let tokens = KiCadParser::tokenize(&sym_lib_table_data);
+                    let item = KiCadParser::parse_syntax_item(&tokens);
+                    let model: SymbolLibTable = SyntaxItemSerializable::deserialize(&item);
+                    model
+                }
+                false => {
+                    SymbolLibTable {
+                        version: 7,
+                        libraries: vec![],
+                    }
+                }
+            };
+            if !sym_lib_table.libraries.iter().any(|e| e.name == library_name) {
+                sym_lib_table.libraries.push(SymbolLibTableItem {
+                    name: library_name.into(),
+                    description,
+                    hidden: false,
+                    disabled: false,
+                    lib_type: "KiCad".into(),
+                    options: String::new(),
+                    uri: format!("{library_path_relative}/{library_name}.kicad_sym").into(),
+                });
+                let items_ser = sym_lib_table.serialize();
+                let tokens = KiCadParser::generate_tokens(&items_ser);
+                let sym_lib_table_data = KiCadParser::stringify_tokens::<SymbolLibTable>(&tokens);
+                fs::write(sym_lib_table_path, sym_lib_table_data)?;
+            }
 
-            println!("All done!");
-        }
-        Err(err) => {
-            println!("Footprint parse error: {}", err);
+            let fp_lib_table_path = project_root_dir.join("fp-lib-table");
+            let mut fp_lib_table = match fs::exists(&fp_lib_table_path)? {
+                true => {
+                    let fp_lib_table_data = fs::read_to_string(&fp_lib_table_path.to_str().unwrap())?;
+                    let tokens = KiCadParser::tokenize(&fp_lib_table_data);
+                    let item = KiCadParser::parse_syntax_item(&tokens);
+                    let model: FootprintLibTable = SyntaxItemSerializable::deserialize(&item);
+                    model
+                }
+                false => {
+                    FootprintLibTable {
+                        version: 7,
+                        libraries: vec![],
+                    }
+                }
+            };
+            if !fp_lib_table.libraries.iter().any(|e| e.name == library_name) {
+                fp_lib_table.libraries.push(FootprintLibTableItem {
+                    name: library_name.into(),
+                    description: "Components downloaded and converted directly from JLCPCB".into(),
+                    disabled: false,
+                    lib_type: "KiCad".into(),
+                    options: String::new(),
+                    uri: format!("{library_path_relative}/{library_name}.pretty").into(),
+                });
+                let items_ser = fp_lib_table.serialize();
+                let tokens = KiCadParser::generate_tokens(&items_ser);
+                let fp_lib_table_data = KiCadParser::stringify_tokens::<FootprintLibTable>(&tokens);
+                fs::write(fp_lib_table_path, fp_lib_table_data)?;
+            }
+
+            println!("The component has been imported.");
         }
     }
-
-    HttpResponse::Ok().await.unwrap()
-}
-
-#[tokio::main]
-async fn main3() -> anyhow::Result<()> {
-    HttpServer::new(|| {
-        App::new().service(handle_footprint)
-    }).bind(("127.0.0.1", 8089))?.run().await?;
-
     Ok(())
 }

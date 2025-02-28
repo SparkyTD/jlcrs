@@ -6,7 +6,7 @@ pub struct GraphicLine {
     pub start: Scalar2D,
     pub end: Scalar2D,
     pub angle: Option<f32>,
-    pub layer: Option<Vec<PcbLayer>>,
+    pub layer: Option<PcbLayer>,
     pub width: f32,
     pub uuid: Option<String>,
 }
@@ -14,7 +14,7 @@ pub struct GraphicLine {
 #[derive(Debug)]
 pub struct GraphicPolygon {
     pub points: Vec<Scalar2D>,
-    pub layer: Option<Vec<PcbLayer>>,
+    pub layer: Option<PcbLayer>,
     pub width: Option<f32>,
     pub fill: Option<bool>,
     pub uuid: Option<String>,
@@ -24,7 +24,7 @@ pub struct GraphicPolygon {
 pub struct GraphicRectangle {
     pub start: Scalar2D,
     pub end: Scalar2D,
-    pub layer: Option<Vec<PcbLayer>>,
+    pub layer: Option<PcbLayer>,
     pub width: f32,
     pub fill: Option<bool>,
     pub uuid: Option<String>,
@@ -34,7 +34,7 @@ pub struct GraphicRectangle {
 pub struct GraphicCircle {
     pub center: Scalar2D,
     pub end: Scalar2D,
-    pub layer: Option<Vec<PcbLayer>>,
+    pub layer: Option<PcbLayer>,
     pub width: f32,
     pub fill: Option<bool>,
     pub uuid: Option<String>,
@@ -45,7 +45,7 @@ pub struct GraphicArc {
     pub start: Scalar2D,
     pub mid: Scalar2D,
     pub end: Scalar2D,
-    pub layer: Option<Vec<PcbLayer>>,
+    pub layer: Option<PcbLayer>,
     pub width: f32,
     pub uuid: Option<String>,
 }
@@ -53,7 +53,7 @@ pub struct GraphicArc {
 #[derive(Debug)]
 pub struct GraphicCurve {
     pub points: Vec<Scalar2D>,
-    pub layer: Option<Vec<PcbLayer>>,
+    pub layer: Option<PcbLayer>,
     pub width: f32,
     pub uuid: Option<String>,
 }
@@ -105,7 +105,7 @@ impl SyntaxItemSerializable for GraphicLine {
                 "end" => line.end = Scalar2D::deserialize(child),
                 "width" => line.width = child.arguments.get(0).unwrap().get_number(),
                 "angle" => line.angle = Some(child.arguments.get(0).unwrap().get_number()),
-                "layers" => line.layer = Some(Vec::<PcbLayer>::deserialize(child)),
+                "layers" => line.layer = Some(PcbLayer::deserialize(child)),
                 "uuid" => line.uuid = Some(child.arguments.first().unwrap().get_string()),
                 _ => panic!("Unsupported child item type in GraphicLine: {}", child.name),
             }
@@ -181,7 +181,7 @@ impl SyntaxItemSerializable for GraphicPolygon {
                     poly.width = Some(child.arguments.get(0).unwrap().get_number());
                 }
                 "layers" => {
-                    poly.layer = Some(Vec::<PcbLayer>::deserialize(child));
+                    poly.layer = Some(PcbLayer::deserialize(child));
                 }
                 "fill" => {
                     let fill_type = child.arguments.first().unwrap().get_string();
@@ -252,7 +252,7 @@ impl SyntaxItemSerializable for GraphicRectangle {
                 "start" => rect.start = Scalar2D::deserialize(child),
                 "end" => rect.end = Scalar2D::deserialize(child),
                 "width" => rect.width = child.arguments.get(0).unwrap().get_number(),
-                "layers" => rect.layer = Some(Vec::<PcbLayer>::deserialize(child)),
+                "layers" => rect.layer = Some(PcbLayer::deserialize(child)),
                 "fill" => {
                     let fill_type = child.arguments.first().unwrap().get_string();
                     rect.fill = Some(fill_type == "solid");
@@ -320,7 +320,7 @@ impl SyntaxItemSerializable for GraphicCircle {
                 "center" => circle.center = Scalar2D::deserialize(child),
                 "end" => circle.end = Scalar2D::deserialize(child),
                 "width" => circle.width = child.arguments.get(0).unwrap().get_number(),
-                "layers" => circle.layer = Some(Vec::<PcbLayer>::deserialize(child)),
+                "layers" => circle.layer = Some(PcbLayer::deserialize(child)),
                 "fill" => {
                     let fill_type = child.arguments.first().unwrap().get_string();
                     circle.fill = Some(fill_type == "solid");
@@ -379,7 +379,7 @@ impl SyntaxItemSerializable for GraphicArc {
                 "mid" => arc.mid = Scalar2D::deserialize(child),
                 "end" => arc.end = Scalar2D::deserialize(child),
                 "width" => arc.width = child.arguments.get(0).unwrap().get_number(),
-                "layers" => arc.layer = Some(Vec::<PcbLayer>::deserialize(child)),
+                "layers" => arc.layer = Some(PcbLayer::deserialize(child)),
                 "uuid" => arc.uuid = Some(child.arguments.first().unwrap().get_string()),
                 _ => panic!("Unsupported child item type in GraphicArc: {}", child.name),
             }
@@ -440,7 +440,7 @@ impl SyntaxItemSerializable for GraphicCurve {
                     curve.width = child.arguments.get(0).unwrap().get_number();
                 }
                 "layers" => {
-                    curve.layer = Some(Vec::<PcbLayer>::deserialize(child));
+                    curve.layer = Some(PcbLayer::deserialize(child));
                 }
                 "uuid" => {
                     curve.uuid = Some(child.arguments.first().unwrap().get_string());

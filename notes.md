@@ -35,3 +35,11 @@ model_data = https://pro.easyeda.com/api/v2/components/$model_id
 model_uuid = model_data[$.result.3d_model_uuid]
 step_url = https://modules.easyeda.com/qAxj6KHrDKw4blvCG8QJPs7Y/$model_uuid
 ```
+
+# SVG Acquisition
+```
+lcsc_id = C93168
+svgs_data = https://easyeda.com/api/products/$lcsc_id/svgs
+symbol_svg = svgs_data[$.result[?(@.docType==2)].svg]
+footprint_svg = svgs_data[$.result[?(@.docType==4)].svg]
+```

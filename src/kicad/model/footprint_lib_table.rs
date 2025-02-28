@@ -56,8 +56,8 @@ impl SyntaxItemSerializable for FootprintLibTableItem {
     fn serialize(&self) -> SyntaxItem {
         let mut children = vec![
             SyntaxItem::from_single_argument("name", SyntaxArgument::QuotedString(self.name.clone(), PositionPreference::None)),
-            SyntaxItem::from_single_argument("uri", SyntaxArgument::QuotedString(self.uri.clone(), PositionPreference::None)),
             SyntaxItem::from_single_argument("type", SyntaxArgument::QuotedString(self.lib_type.clone(), PositionPreference::None)),
+            SyntaxItem::from_single_argument("uri", SyntaxArgument::QuotedString(self.uri.clone(), PositionPreference::None)),
             SyntaxItem::from_single_argument("options", SyntaxArgument::QuotedString(self.options.clone(), PositionPreference::None)),
             SyntaxItem::from_single_argument("descr", SyntaxArgument::QuotedString(self.description.clone(), PositionPreference::None)),
         ];

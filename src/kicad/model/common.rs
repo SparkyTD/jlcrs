@@ -27,11 +27,28 @@ pub struct Id {
     pub id: u32,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct TextEffect {
     pub font: Font,
     pub justify: TextJustify,
     pub hide: bool,
+}
+
+impl Default for TextEffect {
+    fn default() -> Self {
+        Self {
+            font: Font {
+                size: FontSize { width: 1.27, height: 1.27 },
+                ..Default::default()
+            },
+            hide: false,
+            justify: TextJustify {
+                justify_horizontal: None,
+                justify_vertical: None,
+                mirror: false,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
