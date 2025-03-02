@@ -278,14 +278,8 @@ impl TryInto<Symbol> for EasyEDASymbol {
                     current_symbol.pins.push(SymbolPin {
                         position: Position { x: pin.x * scale_factor, y: pin.y * scale_factor, angle: Some(pin.rotation) },
                         length: pin.length * scale_factor,
-                        number: match number_attr.value_visible.is_some_and(|b| b) {
-                            true => Some(number),
-                            false => None,
-                        },
-                        name: match name_attr.value_visible.is_some_and(|b| b) {
-                            true => Some(name),
-                            false => None,
-                        },
+                        number: Some(number),
+                        name: Some(name),
                         name_effects: default_text_effect.clone(),
                         number_effects: default_text_effect.clone(),
                         graphic_style: match pin.pin_shape {

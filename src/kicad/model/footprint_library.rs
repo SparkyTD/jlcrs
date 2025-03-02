@@ -974,7 +974,7 @@ impl SyntaxItemSerializable for FootprintModel {
 
         SyntaxItem {
             name: "model".into(),
-            arguments: vec![SyntaxArgument::Identifier(self.model_file.clone(), PositionPreference::None)],
+            arguments: vec![SyntaxArgument::QuotedString(self.model_file.clone(), PositionPreference::None)],
             children,
         }
     }

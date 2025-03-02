@@ -1,15 +1,17 @@
-use std::fs;
 use crate::args::{CliArguments, Command};
-use clap::Parser;
 use crate::easyeda::api::component_data::ComponentDataResponse;
 use crate::easyeda::api::product_data::ProductDataResponse;
 use crate::easyeda::footprint::EasyEDAFootprint;
 use crate::easyeda::symbol::EasyEDASymbol;
 use crate::kicad::model::footprint_lib_table::{FootprintLibTable, FootprintLibTableItem};
-use crate::kicad::model::footprint_library::{FootprintLibrary, FootprintModel};
+use crate::kicad::model::footprint_library::{FootprintLibrary, FootprintModel, Scalar3D};
 use crate::kicad::model::symbol_lib_table::{SymbolLibTable, SymbolLibTableItem};
 use crate::kicad::model::symbol_library::{Symbol, SymbolLib};
 use crate::kicad::syntax::{KiCadParser, SyntaxItemSerializable};
+use clap::Parser;
+use itertools::Itertools;
+use opencascade::primitives::Shape;
+use std::fs;
 
 mod kicad;
 mod easyeda;
@@ -32,7 +34,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            let library_path_relative = library_root_dir.to_str().unwrap().replace(project_root_dir.to_str().unwrap(), "${{KIPRJMOD}}");
+            let library_path_relative = library_root_dir.to_str().unwrap().replace(project_root_dir.to_str().unwrap(), "${KIPRJMOD}");
 
             let lcsc_code = code[1..].parse::<u32>();
             if !code.starts_with("C") || lcsc_code.is_err() {
@@ -130,40 +132,68 @@ fn main() -> anyhow::Result<()> {
             }
 
             // Download STEP model data
-            let model_id = &component_result.device_info.footprint_info.model_3d.uri;
-            let response = ureq::get(format!("https://pro.easyeda.com/api/v2/components/{model_id}")).call();
-            if let Ok(model_response) = response {
-                let body_string = model_response.into_body().read_to_string()?;
-                let component_data = serde_json::from_str::<ComponentDataResponse>(&body_string)?;
-                if let Some(product_result) = component_data.result {
-                    let model_id = product_result.n3d_model_uuid;
-                    let response = ureq::get(format!("https://modules.easyeda.com/qAxj6KHrDKw4blvCG8QJPs7Y/{model_id}")).call();
-                    if let Ok(model_response) = response {
-                        let body_string = model_response.into_body().read_to_string()?;
-                        println!("Found STEP model, downloading...");
-                        let model_directory = library_root_dir
-                            .join(format!("{library_name}.pretty").as_str())
-                            .join("models");
-                        if !model_directory.exists() {
-                            fs::create_dir_all(&model_directory)?;
-                        }
-                        let model_path = model_directory.join(format!("{safe_part_name}.step"));
-                        fs::write(&model_path, body_string)?;
+            if let Some(model_3d) = &component_result.device_info.footprint_info.model_3d {
+                let model_id = &model_3d.uri;
 
-                        kicad_footprint.model = Some(FootprintModel {
-                            model_file: model_path.to_str().unwrap().to_string(),
-                            opacity: None,
-                            offset: None,
-                            rotate: None,
-                            scale: None,
-                            at: None,
-                        });
+                let response = ureq::get(format!("https://pro.easyeda.com/api/v2/components/{model_id}")).call();
+                if let Ok(model_response) = response {
+                    let body_string = model_response.into_body().read_to_string()?;
+                    let component_data = serde_json::from_str::<ComponentDataResponse>(&body_string)?;
+                    if let Some(product_result) = component_data.result {
+                        let model_id = product_result.n3d_model_uuid;
+                        let response = ureq::get(format!("https://modules.easyeda.com/qAxj6KHrDKw4blvCG8QJPs7Y/{model_id}")).call();
+                        if let Ok(model_response) = response {
+                            let body_string = model_response.into_body().read_to_string()?;
+                            println!("Found STEP model, downloading...");
+                            let model_directory = library_root_dir
+                                .join(format!("{library_name}.pretty").as_str())
+                                .join("models");
+                            if !model_directory.exists() {
+                                fs::create_dir_all(&model_directory)?;
+                            }
+                            let model_path = model_directory.join(format!("{safe_part_name}.step"));
+                            fs::write(&model_path, body_string)?;
+
+                            let shape = Shape::read_step(&model_path)?;
+                            let bounding_box = shape.bounding_box();
+
+                            let center_x = (bounding_box.max_x + bounding_box.min_x) / 2.0;
+                            let center_y = (bounding_box.max_y + bounding_box.min_y) / 2.0;
+                            let min_z = bounding_box.min_z;
+
+                            let model_transform = model_3d.transform
+                                .split(',')
+                                .map(|f| f.parse::<f32>().unwrap())
+                                .collect_vec();
+                            let transform_offset = &model_transform[6..9].iter().map(|v| v * 0.0254).collect_vec();
+                            let rotation = &model_transform[3..6].iter().rev().collect_vec();
+
+                            //println!("origin: [{}, {}, {}]", center_x, center_y, min_z);
+                            //println!("rotation: {:?}", &rotation);
+                            //println!("offset: {:?}", &transform_offset);
+
+                            let rotation_z = (*rotation[2]).to_radians();
+                            let mul_y = rotation_z.cos();
+
+                            let offset_x = -mul_y * center_x * 0.0393701 + transform_offset[0] * 0.0393701;
+                            let offset_y = -mul_y * center_y * 0.0393701 + transform_offset[1] * 0.0393701;
+                            let offset_z = -min_z * 0.0393701 + transform_offset[2] * 0.0393701;
+
+                            kicad_footprint.model = Some(FootprintModel {
+                                model_file: model_path.to_str().unwrap().replace(project_root_dir.to_str().unwrap(), "${KIPRJMOD}"),
+                                opacity: None,
+                                at: Some(Scalar3D::new("xyz", offset_x, offset_y, offset_z)),
+                                rotate: Some(Scalar3D::new("xyz", -*rotation[0], -*rotation[1], -*rotation[2])),
+                                scale: None,
+                                offset: None,
+                            });
+                        }
+                    } else {
+                        println!("No STEP model was found for this component");
                     }
                 } else {
                     println!("No STEP model was found for this component");
                 }
-            } else {
-                println!("No STEP model was found for this component");
             }
 
             let item_ser = symbol_lib.serialize();
@@ -250,4 +280,48 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[allow(unused)]
+struct BoundingBox {
+    min_x: f32,
+    min_y: f32,
+    min_z: f32,
+
+    max_x: f32,
+    max_y: f32,
+    max_z: f32,
+}
+
+trait HasBoundingBox {
+    fn bounding_box(&self) -> BoundingBox;
+}
+
+impl HasBoundingBox for Shape {
+    fn bounding_box(&self) -> BoundingBox {
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut min_z = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        let mut max_z = f32::NEG_INFINITY;
+
+        for vert in self.mesh().vertices {
+            min_x = min_x.min(vert.x as f32);
+            min_y = min_y.min(vert.y as f32);
+            min_z = min_z.min(vert.z as f32);
+            max_x = max_x.max(vert.x as f32);
+            max_y = max_y.max(vert.y as f32);
+            max_z = max_z.max(vert.z as f32);
+        }
+
+        BoundingBox {
+            min_x,
+            min_y,
+            min_z,
+            max_x,
+            max_y,
+            max_z,
+        }
+    }
 }

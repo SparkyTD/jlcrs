@@ -174,7 +174,7 @@ pub struct FootprintInfo {
     #[serde(rename = "std_uuid")]
     pub std_uuid: String,
     #[serde(rename = "model_3d")]
-    pub model_3d: Model3d,
+    pub model_3d: Option<Model3d>,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
